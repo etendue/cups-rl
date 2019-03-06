@@ -81,7 +81,9 @@ class CNNBase(nn.Module):
             init_(nn.Conv2d(64, 32, 3, stride=1)),
             nn.ReLU(),
             Flatten(),
-            init_(nn.Linear(32 * 7 * 7, 512)),
+            #init_(nn.Linear(32 * 7 * 7, 512)),
+            # size does nt match
+            init_(nn.Linear(32 * 12 * 12, 512)),
             nn.ReLU()
         )
 

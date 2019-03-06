@@ -7,6 +7,8 @@ from gym.spaces.box import Box
 from baselines import bench
 from baselines.common.atari_wrappers import make_atari, wrap_deepmind
 
+from gym_ai2thor.envs.ai2thor_env import  AI2ThorEnv
+
 try:
     import dm_control2gym
 except ImportError:
@@ -28,6 +30,8 @@ def make_env(env_id, seed, rank, log_dir, add_timestep):
         if env_id.startswith("dm"):
             _, domain, task = env_id.split('.')
             env = dm_control2gym.make(domain_name=domain, task_name=task)
+        elif env_id.startswith("ai2thor"):
+            env = AI2ThorEnv()
         else:
             env = gym.make(env_id)
         is_atari = hasattr(gym.envs, 'atari') and isinstance(
