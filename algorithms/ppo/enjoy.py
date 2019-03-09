@@ -7,8 +7,8 @@ import torch
 from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
 from baselines.common.vec_env.vec_normalize import VecNormalize
 
-from envs import make_env
-from utils import update_current_obs
+from algorithms.ppo.envs import make_env
+from algorithms.ppo.utils import update_current_obs
 
 
 parser = argparse.ArgumentParser(description='RL')

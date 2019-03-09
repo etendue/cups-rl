@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils import init, init_normc_, AddBias
+from algorithms.ppo.utils import init, init_normc_, AddBias
 
 """
 Modify standard PyTorch distributions so they are compatible with this code.

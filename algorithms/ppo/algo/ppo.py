@@ -10,6 +10,7 @@ class PPO(object):
                  clip_param,
                  ppo_epoch,
                  num_mini_batch,
+                 num_time_step,
                  value_loss_coef,
                  entropy_coef,
                  lr=None,
@@ -21,6 +22,7 @@ class PPO(object):
         self.clip_param = clip_param
         self.ppo_epoch = ppo_epoch
         self.num_mini_batch = num_mini_batch
+        self.num_time_step = num_time_step
 
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
@@ -42,7 +44,7 @@ class PPO(object):
         for e in range(self.ppo_epoch):
             if hasattr(self.actor_critic.base, 'gru'):
                 data_generator = rollouts.recurrent_generator(
-                    advantages, self.num_mini_batch)
+                    advantages, self.num_mini_batch, self.num_time_step)
             else:
                 data_generator = rollouts.feed_forward_generator(
                     advantages, self.num_mini_batch)

@@ -9,18 +9,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from tensorboardX import SummaryWriter
 
-from arguments import get_args
+from algorithms.ppo.arguments import get_args
 from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
 from baselines.common.vec_env.subproc_vec_env import SubprocVecEnv
 from baselines.common.vec_env.vec_normalize import VecNormalize
-from envs import make_env
-from model import Policy
-from storage import RolloutStorage
-from utils import update_current_obs
-from visualize import visdom_plot
+from algorithms.ppo.envs import make_env
+from algorithms.ppo.model import Policy
+from algorithms.ppo.storage import RolloutStorage
+from algorithms.ppo.utils import update_current_obs
+from algorithms.ppo.visualize import visdom_plot
 
-import algo
+import algorithms.ppo.algo as algo
 
 
 args = get_args()
@@ -49,12 +50,14 @@ def main():
     print("WARNING: All rewards are clipped or normalized so you need to use a monitor (see envs.py) or visdom plot to get true rewards")
     print("#######")
 
+    writer = SummaryWriter(comment="ppo_ai2thor")
+
     torch.set_num_threads(1)
 
-    if args.vis:
-        from visdom import Visdom
-        viz = Visdom(port=args.port)
-        win = None
+    #if args.vis:
+    #    from visdom import Visdom
+    #    viz = Visdom(port=args.port)
+    #    win = None
 
     envs = [make_env(args.env_name, args.seed, i, args.log_dir, args.add_timestep)
                 for i in range(args.num_processes)]
@@ -86,7 +89,7 @@ def main():
                                eps=args.eps, alpha=args.alpha,
                                max_grad_norm=args.max_grad_norm)
     elif args.algo == 'ppo':
-        agent = algo.PPO(actor_critic, args.clip_param, args.ppo_epoch, args.num_mini_batch,
+        agent = algo.PPO(actor_critic, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.num_time_step,
                          args.value_loss_coef, args.entropy_coef, lr=args.lr,
                                eps=args.eps,
                                max_grad_norm=args.max_grad_norm)
@@ -182,13 +185,20 @@ def main():
                        final_rewards.min(),
                        final_rewards.max(), dist_entropy,
                        value_loss, action_loss))
-        if args.vis and j % args.vis_interval == 0:
-            try:
-                # Sometimes monitor doesn't properly flush the outputs
-                win = visdom_plot(viz, win, args.log_dir, args.env_name,
-                                  args.algo, args.num_frames)
-            except IOError:
-                pass
+
+            writer.add_scalar("Mean_reward", final_rewards.mean(), total_num_steps)
+            writer.add_scalar("Media_reward", final_rewards.median(), total_num_steps)
+            writer.add_scalar("Entropy", dist_entropy, total_num_steps)
+            writer.add_scalar("V_loss", value_loss, total_num_steps)
+            writer.add_scalar("P_loss", action_loss, total_num_steps)
+        # if args.vis and j % args.vis_interval == 0:
+        #
+        #     try:
+        #         # Sometimes monitor doesn't properly flush the outputs
+        #         win = visdom_plot(viz, win, args.log_dir, args.env_name,
+        #                           args.algo, args.num_frames)
+        #     except IOError:
+        #         pass
 
 if __name__ == "__main__":
     main()

@@ -59,6 +59,8 @@ def get_args():
                         help='add timestep to observations')
     parser.add_argument('--recurrent-policy', action='store_true', default=False,
                         help='use a recurrent policy')
+    parser.add_argument('--num-time-step', type=int, default=32,
+                        help='number time sequence lenght of RNN (default: 32)')
     parser.add_argument('--no-vis', action='store_true', default=False,
                         help='disables visdom visualization')
     parser.add_argument('--port', type=int, default=8097,
