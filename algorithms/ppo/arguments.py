@@ -61,6 +61,9 @@ def get_args():
                         help='use a recurrent policy')
     parser.add_argument('--num-time-step', type=int, default=32,
                         help='number time sequence lenght of RNN (default: 32)')
+    parser.add_argument('--saved-model', default=None,
+                        help='model to load from previous saved one')
+
     parser.add_argument('--no-vis', action='store_true', default=False,
                         help='disables visdom visualization')
     parser.add_argument('--port', type=int, default=8097,

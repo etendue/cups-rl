@@ -30,8 +30,9 @@ def init_normc_(weight, gain=1):
 
 
 def update_current_obs(obs, current_obs, obs_shape, num_stack):
-    shape_dim0 = obs_shape[0]
     obs = torch.from_numpy(obs).float()
     if num_stack > 1:
-        current_obs[:, :-shape_dim0] = current_obs[:, shape_dim0:]
-    current_obs[:, -shape_dim0:] = obs
+        rolled_obs = torch.cat([current_obs[:,-1:], current_obs[:,0:-1]], dim=1)
+        # due to paralell processing, the shift right will not work.
+        current_obs[:] = rolled_obs[:]
+    current_obs[:,0] = obs

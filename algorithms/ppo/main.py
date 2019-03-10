@@ -46,9 +46,9 @@ except OSError:
 
 
 def main():
-    print("#######")
-    print("WARNING: All rewards are clipped or normalized so you need to use a monitor (see envs.py) or visdom plot to get true rewards")
-    print("#######")
+    #print("#######")
+    #print("WARNING: All rewards are clipped or normalized so you need to use a monitor (see envs.py) or visdom plot to get true rewards")
+    #print("#######")
 
     writer = SummaryWriter(comment="ppo_ai2thor")
 
@@ -74,6 +74,9 @@ def main():
     obs_shape = (obs_shape[0] * args.num_stack, *obs_shape[1:])
 
     actor_critic = Policy(obs_shape, envs.action_space, args.recurrent_policy)
+    #load saved model for continuous training
+    if args.saved_model is not None:
+        actor_critic.load_state_dict(torch.load(args.saved_model)[0].state_dict())
 
     if envs.action_space.__class__.__name__ == "Discrete":
         action_shape = 1
