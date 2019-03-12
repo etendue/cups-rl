@@ -121,6 +121,8 @@ class RolloutStorage(object):
             masks_batch = masks_flatted[batch_idx]
             old_action_log_probs_batch = old_action_log_probs_flatted[batch_idx]
             adv_targ = advantages_flatted[batch_idx]
+            ct_batch = torch.Tensor(batch_idx, dtype = torch.int32)
+            ct_batch.data_ = ct_batch.data % T
 
             yield observations_batch, states_batch, actions_batch, \
-              return_batch, masks_batch, old_action_log_probs_batch, adv_targ
+              return_batch, masks_batch, old_action_log_probs_batch, adv_targ, ct_batch

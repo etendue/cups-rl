@@ -52,12 +52,12 @@ class PPO(object):
             for sample in data_generator:
                 observations_batch, states_batch, actions_batch, \
                    return_batch, masks_batch, old_action_log_probs_batch, \
-                        adv_targ = sample
+                        adv_targ, ct_batch = sample
 
                 # Reshape to do in a single forward pass for all steps
                 values, action_log_probs, dist_entropy, states = self.actor_critic.evaluate_actions(
                     observations_batch, states_batch,
-                    masks_batch, actions_batch)
+                    masks_batch, actions_batch, ct_batch)
 
                 ratio = torch.exp(action_log_probs - old_action_log_probs_batch)
                 surr1 = ratio * adv_targ

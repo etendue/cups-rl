@@ -1,5 +1,4 @@
 import copy
-import glob
 import os
 import time
 
@@ -19,13 +18,11 @@ from algorithms.ppo.envs import make_env
 from algorithms.ppo.model import Policy
 from algorithms.ppo.storage import RolloutStorage
 from algorithms.ppo.utils import update_current_obs
-from algorithms.ppo.visualize import visdom_plot
 
 import algorithms.ppo.algo as algo
 
 
 args = get_args()
-
 assert args.algo in ['a2c', 'ppo', 'acktr']
 if args.recurrent_policy:
     assert args.algo in ['a2c', 'ppo'], \
@@ -37,27 +34,11 @@ torch.manual_seed(args.seed)
 if args.cuda:
     torch.cuda.manual_seed(args.seed)
 
-try:
-    os.makedirs(args.log_dir)
-except OSError:
-    files = glob.glob(os.path.join(args.log_dir, '*.monitor.csv'))
-    for f in files:
-        os.remove(f)
-
 
 def main():
-    #print("#######")
-    #print("WARNING: All rewards are clipped or normalized so you need to use a monitor (see envs.py) or visdom plot to get true rewards")
-    #print("#######")
 
     writer = SummaryWriter(comment="ppo_ai2thor")
-
     torch.set_num_threads(1)
-
-    #if args.vis:
-    #    from visdom import Visdom
-    #    viz = Visdom(port=args.port)
-    #    win = None
 
     envs = [make_env(args.env_name, args.seed, i, args.log_dir, args.add_timestep)
                 for i in range(args.num_processes)]
@@ -73,7 +54,7 @@ def main():
     obs_shape = envs.observation_space.shape
     obs_shape = (obs_shape[0] * args.num_stack, *obs_shape[1:])
 
-    actor_critic = Policy(obs_shape, envs.action_space, args.recurrent_policy)
+    actor_critic = Policy(obs_shape, envs.action_space, args.recurrent_policy,args.num_steps)
     #load saved model for continuous training
     if args.saved_model is not None:
         actor_critic.load_state_dict(torch.load(args.saved_model)[0].state_dict())
@@ -86,19 +67,13 @@ def main():
     if args.cuda:
         actor_critic.cuda()
 
-    if args.algo == 'a2c':
-        agent = algo.A2C_ACKTR(actor_critic, args.value_loss_coef,
-                               args.entropy_coef, lr=args.lr,
-                               eps=args.eps, alpha=args.alpha,
-                               max_grad_norm=args.max_grad_norm)
-    elif args.algo == 'ppo':
+    if args.algo == 'ppo':
         agent = algo.PPO(actor_critic, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.num_time_step,
                          args.value_loss_coef, args.entropy_coef, lr=args.lr,
                                eps=args.eps,
                                max_grad_norm=args.max_grad_norm)
-    elif args.algo == 'acktr':
-        agent = algo.A2C_ACKTR(actor_critic, args.value_loss_coef,
-                               args.entropy_coef, acktr=True)
+    else:
+        raise NotImplementedError
 
     rollouts = RolloutStorage(args.num_steps, args.num_processes, obs_shape, envs.action_space, actor_critic.state_size)
     current_obs = torch.zeros(args.num_processes, *obs_shape)
@@ -124,7 +99,7 @@ def main():
                 value, action, action_log_prob, states = actor_critic.act(
                         rollouts.observations[step],
                         rollouts.states[step],
-                        rollouts.masks[step])
+                        rollouts.masks[step], step)
             cpu_actions = action.squeeze(1).cpu().numpy()
 
             # Obser reward and next obs
@@ -152,7 +127,7 @@ def main():
         with torch.no_grad():
             next_value = actor_critic.get_value(rollouts.observations[-1],
                                                 rollouts.states[-1],
-                                                rollouts.masks[-1]).detach()
+                                                rollouts.masks[-1], rollouts.step).detach()
 
         rollouts.compute_returns(next_value, args.use_gae, args.gamma, args.tau)
 
@@ -172,8 +147,7 @@ def main():
             if args.cuda:
                 save_model = copy.deepcopy(actor_critic).cpu()
 
-            save_model = [save_model,
-                            hasattr(envs, 'ob_rms') and envs.ob_rms or None]
+            save_model = [save_model, hasattr(envs, 'ob_rms') and envs.ob_rms or None]
 
             torch.save(save_model, os.path.join(save_path, args.env_name + ".pt"))
 
@@ -198,14 +172,6 @@ def main():
             writer.add_scalars("Losses",{"value":value_loss,"policy":action_loss},total_num_steps)
             writer.add_scalar("Entropy", dist_entropy, total_num_steps)
 
-        # if args.vis and j % args.vis_interval == 0:
-        #
-        #     try:
-        #         # Sometimes monitor doesn't properly flush the outputs
-        #         win = visdom_plot(viz, win, args.log_dir, args.env_name,
-        #                           args.algo, args.num_frames)
-        #     except IOError:
-        #         pass
 
 if __name__ == "__main__":
     main()
