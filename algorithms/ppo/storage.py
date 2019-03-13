@@ -1,5 +1,5 @@
 import torch
-from math import ceil
+from math import ceil,floor
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 
 def _flatten_helper(T, N, _tensor):
@@ -91,72 +91,36 @@ class RolloutStorage(object):
 
     def recurrent_generator(self, advantages, num_mini_batch,num_time_step = 1):
         num_processes = self.rewards.size(1)
-        assert num_processes >= num_mini_batch, (
-            f"PPO requires the number processes ({num_processes}) "
-            f"to be greater than or equal to the number of PPO mini batches ({num_mini_batch}).")
-        num_envs_per_batch = num_processes // num_mini_batch
-        perm = torch.randperm(num_processes)
-        for start_ind in range(0, num_processes, num_envs_per_batch):
-            observations_batch = []
-            states_batch = []
-            actions_batch = []
-            return_batch = []
-            masks_batch = []
-            old_action_log_probs_batch = []
-            adv_targ = []
+        num_t_slices = floor(self.num_steps*num_processes/num_time_step)
+        mini_batch_size = num_t_slices//num_mini_batch
+        sampler = BatchSampler(SubsetRandomSampler(range(num_t_slices)), mini_batch_size, drop_last=True)
+        T, N = self.num_steps, num_processes
 
-            for offset in range(num_envs_per_batch):
-                ind = perm[start_ind + offset]
-                observations_batch.append(self.observations[:-1, ind])
-                #states_batch.append(self.states[0:1, ind])
-                states_batch.append(self.states[:-1, ind])
-                actions_batch.append(self.actions[:, ind])
-                return_batch.append(self.returns[:-1, ind])
-                masks_batch.append(self.masks[:-1, ind])
-                old_action_log_probs_batch.append(self.action_log_probs[:, ind])
-                adv_targ.append(advantages[:, ind])
+        #stack the tensor along the dim of processes
+        observations_flatted= self.observations[:-1].view(T*N, *self.observations.shape[2:])
+        states_flatted = self.states[:-1].view(T*N, *self.states.shape[2:])
+        actions_flatted = self.actions.view(T*N, *self.actions.shape[2:])
+        return_flatted = self.returns[:-1].view(T*N,*self.returns.shape[2:])
+        masks_flatted = self.masks[:-1].view(T*N,*self.masks.shape[2:])
+        old_action_log_probs_flatted = self.action_log_probs.view(T*N,*self.action_log_probs.shape[2:])
+        advantages_flatted = advantages.view(T*N,*advantages.shape[2:])
 
+        num_of_data = observations_flatted.shape[0]
+        for indices in sampler:
+            batch_idx = []
+            state_idx = []
+            for i in indices:
+                t = i * num_time_step
+                state_idx.append(t)
+                batch_idx.extend(list(range(t,t+num_time_step)))
 
-            T, N = self.num_steps, num_envs_per_batch
-            # These are all tensors of size (T, N, -1)
-            observations_batch = torch.stack(observations_batch, 1)
-            actions_batch = torch.stack(actions_batch, 1)
-            return_batch = torch.stack(return_batch, 1)
-            masks_batch = torch.stack(masks_batch, 1)
-            old_action_log_probs_batch = torch.stack(old_action_log_probs_batch, 1)
-            adv_targ = torch.stack(adv_targ, 1)
+            observations_batch = observations_flatted[batch_idx]
+            states_batch = states_flatted[state_idx]
+            actions_batch = actions_flatted[batch_idx]
+            return_batch = return_flatted[batch_idx]
+            masks_batch = masks_flatted[batch_idx]
+            old_action_log_probs_batch = old_action_log_probs_flatted[batch_idx]
+            adv_targ = advantages_flatted[batch_idx]
 
-            # States is just a (N, -1) tensor
-            #states_batch = torch.stack(states_batch, 1).view(N, -1)
-            states_batch = torch.stack(states_batch,1)
-
-
-            # Flatten the (T, N, ...) tensors to (T * N, ...)
-            observations_batch = _flatten_helper(T, N, observations_batch)
-            actions_batch = _flatten_helper(T, N, actions_batch)
-            return_batch = _flatten_helper(T, N, return_batch)
-            masks_batch = _flatten_helper(T, N, masks_batch)
-            old_action_log_probs_batch = _flatten_helper(T, N, \
-                    old_action_log_probs_batch)
-            adv_targ = _flatten_helper(T, N, adv_targ)
-            states_batch = _flatten_helper(T,N,states_batch)
-
-            # split the batches into time-sequence
-            num_chunk = ceil(self.observations.size()[0] / num_time_step)
-            chunk_size = num_time_step * num_envs_per_batch
-
-            observations_batchs = torch.split(observations_batch,chunk_size,dim=0)
-            actions_batchs = torch.split(actions_batch,chunk_size,dim=0)
-            return_batchs = torch.split(return_batch,chunk_size,dim=0)
-            masks_batchs = torch.split(masks_batch,chunk_size,dim=0)
-            old_action_log_probs_batchs = torch.split(old_action_log_probs_batch,chunk_size,dim=0)
-            adv_targs = torch.split(adv_targ,chunk_size,dim=0)
-            states_batchs = torch.split(states_batch,chunk_size,dim=0)
-            perm_T = torch.randperm(num_chunk)
-
-            for t in perm_T:
-                yield observations_batchs[t],states_batchs[t][0:-1:num_time_step],actions_batchs[t],\
-                    return_batchs[t],masks_batchs[t],old_action_log_probs_batchs[t],adv_targs[t]
-
-            #yield observations_batch, states_batch, actions_batch, \
-            #    return_batch, masks_batch, old_action_log_probs_batch, adv_targ
+            yield observations_batch, states_batch, actions_batch, \
+              return_batch, masks_batch, old_action_log_probs_batch, adv_targ

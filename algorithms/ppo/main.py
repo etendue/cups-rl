@@ -189,11 +189,15 @@ def main():
                        final_rewards.max(), dist_entropy,
                        value_loss, action_loss))
 
-            writer.add_scalar("Mean_reward", final_rewards.mean(), total_num_steps)
-            writer.add_scalar("Media_reward", final_rewards.median(), total_num_steps)
+            writer.add_scalars("Reward", {"mean":final_rewards.mean(),
+                                                        "median":final_rewards.median(),
+                                                        "min":final_rewards.min(),
+                                                        "max":final_rewards.max()
+                                                        },
+                                                        total_num_steps)
+            writer.add_scalars("Losses",{"value":value_loss,"policy":action_loss},total_num_steps)
             writer.add_scalar("Entropy", dist_entropy, total_num_steps)
-            writer.add_scalar("V_loss", value_loss, total_num_steps)
-            writer.add_scalar("P_loss", action_loss, total_num_steps)
+
         # if args.vis and j % args.vis_interval == 0:
         #
         #     try:
