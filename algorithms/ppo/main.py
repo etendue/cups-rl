@@ -99,7 +99,8 @@ def main():
                 value, action, action_log_prob, states = actor_critic.act(
                         rollouts.observations[step],
                         rollouts.states[step],
-                        rollouts.masks[step], step)
+                        rollouts.masks[step],
+                        rollouts.time_steps[step])
             cpu_actions = action.squeeze(1).cpu().numpy()
 
             # Obser reward and next obs
@@ -124,10 +125,17 @@ def main():
             update_current_obs(obs, current_obs, obs_shape, args.num_stack)
             rollouts.insert(current_obs, states, action, action_log_prob, value, reward, masks)
 
+        if j % args.log_interval == 0:
+            end = time.time()
+            total_num_steps = (j + 1) * args.num_processes * args.num_steps
+            print("Updates {}, num timesteps {}, FPS {}".
+                format(j, total_num_steps, int(total_num_steps / (end - start))))
+
         with torch.no_grad():
             next_value = actor_critic.get_value(rollouts.observations[-1],
                                                 rollouts.states[-1],
-                                                rollouts.masks[-1], rollouts.step).detach()
+                                                rollouts.masks[-1],
+                                                rollouts.time_steps[-1]).detach()
 
         rollouts.compute_returns(next_value, args.use_gae, args.gamma, args.tau)
 

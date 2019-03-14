@@ -11,16 +11,16 @@ class Flatten(nn.Module):
 
 
 class Policy(nn.Module):
-    def __init__(self, obs_shape, action_space, recurrent_policy):
+    def __init__(self, obs_shape, action_space, recurrent_policy, episode_length):
         super(Policy, self).__init__()
         if len(obs_shape) == 3:
-            self.base = CNNBase(obs_shape[0], recurrent_policy)
+            self.base = CNNBase(obs_shape[0], recurrent_policy,episode_length)
         else:
             raise NotImplementedError
 
         if action_space.__class__.__name__ == "Discrete":
             num_outputs = action_space.n
-            self.dist = Categorical(self.base.output_size + self.time_emb_size, num_outputs)
+            self.dist = Categorical(self.base.output_size , num_outputs)
         else:
             raise NotImplementedError
 
@@ -97,6 +97,16 @@ class CNNBase(nn.Module):
 
         self.train()
 
+
+    @property
+    def output_size(self):
+        return 512
+
+    @property
+    def state_size(self):
+        return 512
+
+
     def forward(self, inputs, states, masks, ct):
         x = self.main(inputs / 255.0)
 
@@ -127,4 +137,4 @@ class CNNBase(nn.Module):
 
         time_emb = self.time_embedding(ct)
 
-        return self.critic_linear(torch.cat(x, time_emb)), x, states
+        return self.critic_linear(torch.cat((x, time_emb),dim=1)), x, states

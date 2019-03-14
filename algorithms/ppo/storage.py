@@ -22,6 +22,9 @@ class RolloutStorage(object):
         if action_space.__class__.__name__ == 'Discrete':
             self.actions = self.actions.long()
         self.masks = torch.ones(num_steps + 1, num_processes, 1)
+        time_steps = [torch.Tensor(range(0,num_steps)) for _ in range(num_processes)]
+        self.time_steps = torch.stack(time_steps,dim=1).type(dtype=torch.long)
+        self.time_steps = self.time_steps
 
         self.num_steps = num_steps
         self.step = 0
@@ -35,6 +38,7 @@ class RolloutStorage(object):
         self.action_log_probs = self.action_log_probs.cuda()
         self.actions = self.actions.cuda()
         self.masks = self.masks.cuda()
+        self.time_steps= self.time_steps.cuda()
 
     def insert(self, current_obs, state, action, action_log_prob, value_pred, reward, mask):
         self.observations[self.step + 1].copy_(current_obs)
@@ -67,28 +71,6 @@ class RolloutStorage(object):
                     gamma * self.masks[step + 1] + self.rewards[step]
 
 
-    def feed_forward_generator(self, advantages, num_mini_batch):
-        num_steps, num_processes = self.rewards.size()[0:2]
-        batch_size = num_processes * num_steps
-        assert batch_size >= num_mini_batch, (
-            f"PPO requires the number processes ({num_processes}) "
-            f"* number of steps ({num_steps}) = {num_processes * num_steps} "
-            f"to be greater than or equal to the number of PPO mini batches ({num_mini_batch}).")
-        mini_batch_size = batch_size // num_mini_batch
-        sampler = BatchSampler(SubsetRandomSampler(range(batch_size)), mini_batch_size, drop_last=False)
-        for indices in sampler:
-            observations_batch = self.observations[:-1].view(-1,
-                                        *self.observations.size()[2:])[indices]
-            states_batch = self.states[:-1].view(-1, self.states.size(-1))[indices]
-            actions_batch = self.actions.view(-1, self.actions.size(-1))[indices]
-            return_batch = self.returns[:-1].view(-1, 1)[indices]
-            masks_batch = self.masks[:-1].view(-1, 1)[indices]
-            old_action_log_probs_batch = self.action_log_probs.view(-1, 1)[indices]
-            adv_targ = advantages.view(-1, 1)[indices]
-
-            yield observations_batch, states_batch, actions_batch, \
-                return_batch, masks_batch, old_action_log_probs_batch, adv_targ
-
     def recurrent_generator(self, advantages, num_mini_batch,num_time_step = 1):
         num_processes = self.rewards.size(1)
         num_t_slices = floor(self.num_steps*num_processes/num_time_step)
@@ -104,8 +86,8 @@ class RolloutStorage(object):
         masks_flatted = self.masks[:-1].view(T*N,*self.masks.shape[2:])
         old_action_log_probs_flatted = self.action_log_probs.view(T*N,*self.action_log_probs.shape[2:])
         advantages_flatted = advantages.view(T*N,*advantages.shape[2:])
+        time_steps_flattend= self.time_steps.view(T*N)
 
-        num_of_data = observations_flatted.shape[0]
         for indices in sampler:
             batch_idx = []
             state_idx = []
@@ -121,8 +103,7 @@ class RolloutStorage(object):
             masks_batch = masks_flatted[batch_idx]
             old_action_log_probs_batch = old_action_log_probs_flatted[batch_idx]
             adv_targ = advantages_flatted[batch_idx]
-            ct_batch = torch.Tensor(batch_idx, dtype = torch.int32)
-            ct_batch.data_ = ct_batch.data % T
+            ct_batch = time_steps_flattend[batch_idx]
 
             yield observations_batch, states_batch, actions_batch, \
               return_batch, masks_batch, old_action_log_probs_batch, adv_targ, ct_batch
