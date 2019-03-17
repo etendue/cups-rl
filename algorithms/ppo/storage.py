@@ -13,6 +13,7 @@ class RolloutStorage(object):
         self.rewards = torch.zeros(num_steps, num_processes, 1)
         self.value_preds = torch.zeros(num_steps + 1, num_processes, 1)
         self.returns = torch.zeros(num_steps + 1, num_processes, 1)
+        self.advantages = torch.zeros(num_steps, num_processes, 1)
         self.action_log_probs = torch.zeros(num_steps, num_processes, 1)
         if action_space.__class__.__name__ == 'Discrete':
             action_shape = 1
@@ -21,10 +22,6 @@ class RolloutStorage(object):
         self.actions = torch.zeros(num_steps, num_processes, action_shape)
         if action_space.__class__.__name__ == 'Discrete':
             self.actions = self.actions.long()
-        self.masks = torch.ones(num_steps + 1, num_processes, 1)
-        time_steps = [torch.Tensor(range(0,num_steps)) for _ in range(num_processes)]
-        self.time_steps = torch.stack(time_steps,dim=1).type(dtype=torch.long)
-        self.time_steps = self.time_steps
 
         self.num_steps = num_steps
         self.step = 0
@@ -70,40 +67,32 @@ class RolloutStorage(object):
                 self.returns[step] = self.returns[step + 1] * \
                     gamma * self.masks[step + 1] + self.rewards[step]
 
+        advantages = self.returns[:-1] - self.value_preds[:-1]
+        self.advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
 
-    def recurrent_generator(self, advantages, num_mini_batch,num_time_step = 1):
-        num_processes = self.rewards.size(1)
-        num_t_slices = floor(self.num_steps*num_processes/num_time_step)
-        mini_batch_size = num_t_slices//num_mini_batch
-        sampler = BatchSampler(SubsetRandomSampler(range(num_t_slices)), mini_batch_size, drop_last=True)
-        T, N = self.num_steps, num_processes
+    def sample_generator(self,num_mini_batch,horizon_length):
+        t = horizon_length
+        n = self.observations.shape[0]
+        assert n%t == 0, f"total steps ({n}) is multitude of horizon length {t}"
 
-        #stack the tensor along the dim of processes
-        observations_flatted= self.observations[:-1].view(T*N, *self.observations.shape[2:])
-        states_flatted = self.states[:-1].view(T*N, *self.states.shape[2:])
-        actions_flatted = self.actions.view(T*N, *self.actions.shape[2:])
-        return_flatted = self.returns[:-1].view(T*N,*self.returns.shape[2:])
-        masks_flatted = self.masks[:-1].view(T*N,*self.masks.shape[2:])
-        old_action_log_probs_flatted = self.action_log_probs.view(T*N,*self.action_log_probs.shape[2:])
-        advantages_flatted = advantages.view(T*N,*advantages.shape[2:])
-        time_steps_flattend= self.time_steps.view(T*N)
+        o = self.observations[:-1].view(-1,t,*self.observations.shape[2:])
+        s = self.states[:-1].view(-1,t,*self.states.shape[2:])
+        a = self.actions.view(-1,t,*self.actions.shape[2:])
+        r = self.returns.view(-1,t, *self.returns.shape[2:])
+        m = self.masks.view(-1,t, *self.masks.shape[2:])
 
-        for indices in sampler:
-            batch_idx = []
-            state_idx = []
-            for i in indices:
-                t = i * num_time_step
-                state_idx.append(t)
-                batch_idx.extend(list(range(t,t+num_time_step)))
+        old_logp = self.action_log_probs.view(-1, t,*self.action_log_probs.shape[2:])
+        adv = self.advantages.view(-1,t, *self.advantages.shape[2:])
 
-            observations_batch = observations_flatted[batch_idx]
-            states_batch = states_flatted[state_idx]
-            actions_batch = actions_flatted[batch_idx]
-            return_batch = return_flatted[batch_idx]
-            masks_batch = masks_flatted[batch_idx]
-            old_action_log_probs_batch = old_action_log_probs_flatted[batch_idx]
-            adv_targ = advantages_flatted[batch_idx]
-            ct_batch = time_steps_flattend[batch_idx]
+        num_slices = o.shape[0]
+        mini_batch_size = num_slices//num_mini_batch
+        sampler = BatchSampler(SubsetRandomSampler(range(num_slices)), mini_batch_size, drop_last=True)
 
-            yield observations_batch, states_batch, actions_batch, \
-              return_batch, masks_batch, old_action_log_probs_batch, adv_targ, ct_batch
+        for idx in sampler:
+            yield o[idx].view(-1,*o.shape[2:]),\
+                  s[idx].view(-1,*s.shape[2:]),\
+                  a[idx].view(-1,*a.shape[2:]),\
+                  r[idx].view(-1,*r.shape[2:]),\
+                  m[idx].view(-1,*m.shape[2:]),\
+                  old_logp[idx].view(-1,old_logp.shape[2:]),\
+                  adv[idx].view(-1,adv.shape[2:])

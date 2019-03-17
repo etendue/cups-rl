@@ -57,10 +57,9 @@ def get_args():
                         help='disables CUDA training')
     parser.add_argument('--add-timestep', action='store_true', default=False,
                         help='add timestep to observations')
-    parser.add_argument('--recurrent-policy', action='store_true', default=False,
+    parser.add_argument('--recurrent-policy', action='store_true', default=True,
                         help='use a recurrent policy')
-    parser.add_argument('--num-time-step', type=int, default=25,
-                        help='number time sequence lenght of RNN (default: 32)')
+
     parser.add_argument('--saved-model', default=None,
                         help='model to load from previous saved one')
 
