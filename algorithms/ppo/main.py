@@ -17,9 +17,9 @@ from algorithms.ppo.ppo import PPO
 
 
 def main(args):
-    steps_per_update = args.steps_per_update
-    local_steps_per_epoch = steps_per_update // args.num_processes
-    total_eposides = int(args.num_frames) // steps_per_update
+    steps_per_update = args.steps_per_epoch
+    local_steps_per_update = steps_per_update // args.num_processes
+    total_updates = int(args.num_frames) // steps_per_update
 
     torch.manual_seed(args.seed)
     torch.set_num_threads(1)
@@ -35,7 +35,7 @@ def main(args):
             args.save_dir = ""
 
     writer = SummaryWriter(comment="ppo_ai2thor")
-    envs = [AI2ThorEnv() for _ in range(args.num_processes)]
+    envs = [AI2ThorEnv for _ in range(args.num_processes)]
 
     if args.num_processes > 1:
         envs = SubprocVecEnv(envs)
@@ -45,8 +45,9 @@ def main(args):
     if len(envs.observation_space.shape) == 1:
         envs = VecNormalize(envs, gamma=args.gamma)
 
-    obs_shape = envs.observation_space.shape
-    actor_critic = ActorCritic(obs_shape, envs.action_space, args.num_steps)
+    num_channel,w_dim, h_dim = envs.observation_space.shape
+    action_dim = envs.action_space.n
+    actor_critic = ActorCritic(num_channel,action_dim,w_dim)
 
     # load saved model for continuous training
     if args.saved_model:
@@ -65,11 +66,10 @@ def main(args):
                 eps=args.eps,
                 max_grad_norm=args.max_grad_norm)
 
-    buf = RolloutStorage(local_steps_per_epoch,
+    buf = RolloutStorage(local_steps_per_update,
                          args.num_processes,
-                         obs_shape,
-                         envs.action_space,
-                         actor_critic.lstm_cell_size)
+                         envs.observation_space.shape,
+                         actor_critic.rnn_state_size)
 
     # These variables are used to compute average rewards for all processes.
     episode_rewards = np.zeros([args.num_processes])
@@ -79,19 +79,20 @@ def main(args):
         buf.cuda()
 
     obs0 = envs.reset()/255
-    buf.obs[0].copy_(torch.Tensor(obs0))
+    buf.obs[0].copy_(torch.tensor(obs0).unsqueeze(1))
 
     start = time.time()
-    for ep in range(total_eposides):
+    for ep in range(total_updates):
         epsisode_start = time.time()
         actor_critic.eval()
-        for step in range(local_steps_per_epoch):
+        for step in range(local_steps_per_update):
             # Sample actions
             state = (buf.obs[step], buf.memory[step], buf.masks[step])
             v, pi, log_pi, _, h_rnn = actor_critic(state)
             a = pi.cpu().numpy()
 
-            # interact with environment
+            # interact with environment, Tricky thing here is the envs reset itsself when one env is done
+            # so next_o is for next episode
             next_o, r, done, _ = envs.step(a)
             r = np.array(r).astype(float)
 
@@ -104,7 +105,6 @@ def main(args):
 
             # convert to Torch tensor
             next_o = torch.Tensor(next_o/255)
-            next_o *= mask.view(-1, 1, 1, 1)
             r = torch.Tensor(r)
             mask = torch.Tensor(done)
 
@@ -116,7 +116,7 @@ def main(args):
 
         actor_critic.train()
         # do PPO clip_param decay
-        agent.clip_param = (args.clip_param - 0.001) * (total_eposides - ep)/total_eposides + 0.001
+        agent.clip_param = (args.clip_param - 0.001) * (total_updates - ep)/total_updates + 0.001
         value_loss, action_loss, dist_entropy = agent.update(buf)
         buf.after_update()
 
@@ -158,7 +158,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='RL')
-    parser.add_argument('--lr', type=float, default=7e-4,
+    parser.add_argument('--lr', type=float, default=2.5e-4,
                         help='learning rate (default: 7e-4)')
     parser.add_argument('--eps', type=float, default=1e-5,
                         help='RMSprop optimizer epsilon (default: 1e-5)')
@@ -166,7 +166,7 @@ if __name__ == "__main__":
                         help='RMSprop optimizer apha (default: 0.99)')
     parser.add_argument('--gamma', type=float, default=0.99,
                         help='discount factor for rewards (default: 0.99)')
-    parser.add_argument('--use-gae', action='store_true', default=False,
+    parser.add_argument('--use-gae', action='store_true', default=True,
                         help='use generalized advantage estimation')
     parser.add_argument('--tau', type=float, default=0.95,
                         help='gae parameter (default: 0.95)')
@@ -194,8 +194,8 @@ if __name__ == "__main__":
                         help='save interval, one save per n updates (default: 10)')
     parser.add_argument('--num-frames', type=int, default=10e6,
                         help='number of frames to train (default: 10e6)')
-    parser.add_argument('--save-dir', default='./trained_models/',
-                        help='directory to save agent logs (default: ./trained_models/)')
+    parser.add_argument('--save-dir', default='',
+                        help='directory to save agent logs (default: )')
     parser.add_argument('--saved-model', default=None,
                         help='model to load from previous saved one')
     parser.add_argument('--no-cuda', action='store_true', default=False,

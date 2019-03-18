@@ -7,13 +7,16 @@ class RolloutStorage(object):
     def __init__(self, num_steps, num_processes, obs_shape, state_size):
         self.obs = torch.zeros(num_steps + 1, num_processes, *obs_shape)
         self.memory = torch.zeros(num_steps + 1, num_processes, state_size)
-        self.r = torch.zeros(num_steps, num_processes, 1)
+        self.masks = torch.ones(num_steps + 1, num_processes, 1)
         self.v = torch.zeros(num_steps + 1, num_processes, 1)
         self.g = torch.zeros(num_steps + 1, num_processes, 1)
+
+        #
         self.adv = torch.zeros(num_steps, num_processes, 1)
+        self.r = torch.zeros(num_steps, num_processes, 1)
         self.logp_a = torch.zeros(num_steps, num_processes, 1)
         self.a = torch.zeros(num_steps, num_processes, 1).long()
-        self.masks = torch.ones(num_steps + 1, num_processes, 1)
+
         self.num_steps = num_steps
         self.index = 0
 
@@ -65,18 +68,18 @@ class RolloutStorage(object):
         n = self.obs.shape[0]
         assert n % t == 0, f"total steps ({n}) is multitude of horizon length {t}"
 
-        o = self.obs[:-1].view(-1, t, *self.obs.shape[2:])
-        s = self.memory[:-1].view(-1, t, *self.memory.shape[2:])
-        a = self.a.view(-1, t, *self.a.shape[2:])
-        g = self.g.view(-1, t, *self.g.shape[2:])
-        m = self.masks.view(-1,t, *self.masks.shape[2:])
+        o = self.obs[:-1].view(t, -1, *self.obs.shape[2:])
+        h = self.memory[:-1].view(t, -1, *self.memory.shape[2:])
+        m = self.masks[:-1].view(t,-1, *self.masks.shape[2:])
+        g = self.g[:-1].view(t, -1, *self.g.shape[2:])
 
-        logp_a = self.logp_a.view(-1, t, *self.logp_a.shape[2:])
-        adv = self.adv.view(-1, t, *self.adv.shape[2:])
+        a = self.a.view(t, -1, *self.a.shape[2:])
+        logp_a = self.logp_a.view(t, -1, *self.logp_a.shape[2:])
+        adv = self.adv.view(t, -1, *self.adv.shape[2:])
 
         num_slices = o.shape[0]
         mini_batch_size = num_slices//num_mini_batch
         sampler = BatchSampler(SubsetRandomSampler(range(num_slices)), mini_batch_size, drop_last=True)
 
         for idx in sampler:
-            yield o[idx], s[idx], a[idx], g[idx], m[idx], logp_a[idx], adv[idx]
+            yield o[:,idx], h[0,idx].squeeze(0), a[:,idx], g[:,idx], m[:,idx], logp_a[:,idx], adv[:,idx]

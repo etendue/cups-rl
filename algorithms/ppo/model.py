@@ -5,8 +5,8 @@ from torch.distributions.categorical import Categorical
 import numpy as np
 
 
-def calculate_lstm_input_size_after_4_conv_layers(frame_dim, stride=2, kernel_size=3, padding=1,
-                                     num_filters=32):
+def calculate_output_size_after_4_conv_layers(frame_dim, stride=2, kernel_size=3, padding=1,
+                                              num_filters=32):
     """
     Assumes square resolution image. Find LSTM size after 4 conv layers below in A3C using regular
     Convolution math. For example:
@@ -71,9 +71,9 @@ class ActorCritic(torch.nn.Module):
         self.conv4 = nn.Conv2d(32, 32, 3, stride=2, padding=1)
 
         # assumes square image
-        self.lstm_cell_size = calculate_lstm_input_size_after_4_conv_layers(frame_dim)
-
-        self.lstm = nn.LSTMCell(self.lstm_cell_size, 256)  # for 128x128 input
+        self.rnn_input_size = calculate_output_size_after_4_conv_layers(frame_dim)
+        self.rnn_state_size = 256
+        self.lstm = nn.GRUCell(self.rnn_input_size, self.rnn_state_size)  # for 128x128 input
 
         self.critic_linear = nn.Linear(256, 1)
         self.actor_linear = nn.Linear(256, num_outputs)
@@ -93,7 +93,7 @@ class ActorCritic(torch.nn.Module):
 
     def forward(self, inputs, actions=None):
 
-        outputs, (hx_out, cx_out) = self._feature_extractor(inputs)
+        outputs, rnn_out = self._feature_extractor(inputs)
         v = self.critic_linear(outputs)
         logits = self.actor_linear(outputs)
         dist = Categorical(logits=logits)
@@ -108,29 +108,29 @@ class ActorCritic(torch.nn.Module):
         a = actions.squeeze()
         logp_a = logp_a.squeeze()
         ent = entropy.squeeze()
-        hx_out = hx_out.squeeze()
-        cx_out = cx_out.squeeze()
-        h = (hx_out,cx_out)
-        return v, a, logp_a, ent, h
+        rnn_out = rnn_out.squeeze()
+
+        return v, a, logp_a, ent, rnn_out
 
     def value_function(self,inputs):
-        outputs, (hx_out, cx_out) = self._feature_extractor(inputs)
+        outputs, _ = self._feature_extractor(inputs)
         v = self.critic_linear(outputs)
         return v.squeeze()
 
     def _feature_extractor(self,inputs):
-        inputs, (hx, cx), mask = inputs
+
+        # inputs has shape [T, batch,channel, w, h]
+        # rnn_in has shape [batch, hidden_state_size]
+        # mask has shape   [T, batch,1]
+        inputs, rnn_in, mask = inputs
+
+        assert (len(inputs.size()) == 3 and len(rnn_in.size()) == 1 and len(mask.size()) == 1) or \
+               (len(inputs.size()) == 5 and len(rnn_in.size()) == 2 and len(mask.size()) == 3)
 
         if len(inputs.size()) == 3:  # if batch forgotten, with 1 time step
             x = inputs.unsqueeze(0).unsqueeze(0)
-            hx = hx.unsqueeze(0).unsqueeze(0)
-            cx = cx.unsqueeze(0).unsqueeze(0)
+            rnn_in.unsqueeze(0)
             mask = mask.unsqueeze(0).unsqueeze(0)
-        elif len(inputs.size()) == 4:  # batch but with 1 time step
-            x = inputs.unsqueeze(0)
-            hx = hx.unsqueeze(0)
-            cx = cx.unsqueeze(0)
-            mask = mask.unsqueeze(0)
 
         # data is organized in order [T, batch, channel, w,h]
         T, batch_size, c, w, h = inputs.size()
@@ -144,16 +144,14 @@ class ActorCritic(torch.nn.Module):
         x = F.elu(self.conv4(x))
 
         # convert back to time sequence for RNN cell
+        x = x.view(T, batch_size, self.rnn_input_size)
+        outputs = torch.empty(T, batch_size, self.rnn_state_size, device = x.device())
 
-        x = x.view(T, batch_size, self.lstm_cell_size)
-        mask = mask.view(T, batch_size, 1)
-        outputs = torch.empty_like(x)
-
-        hx_out, cx_out = hx[0], cx[0]
+        hidden_state = rnn_in
         for t in range(T):
-            hx_out, cx_out = self.lstm(x[t], (hx_out * mask[t], hx_out* mask[t]))
-            outputs[t].copy_(hx_out)
+            out = hidden_state= self.gru(x[t], hidden_state* mask[t])
+            outputs[t].copy_(out)
 
-        outputs = outputs.view(T * batch_size, self.lstm_cell_size)
+        outputs = outputs.view(T * batch_size, self.rnn_state_size)
         # the output has shape [T*batch, lstm_cell_size], hx_out, cx_out [batch, lstm_cell_size]
-        return outputs, (hx_out, cx_out)
+        return outputs, hidden_state
