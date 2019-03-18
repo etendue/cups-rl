@@ -77,7 +77,7 @@ class RolloutStorage(object):
         logp_a = self.logp_a.view(t, -1, *self.logp_a.shape[2:])
         adv = self.adv.view(t, -1, *self.adv.shape[2:])
 
-        num_slices = o.shape[0]
+        num_slices = o.shape[1]
         mini_batch_size = num_slices//num_mini_batch
         sampler = BatchSampler(SubsetRandomSampler(range(num_slices)), mini_batch_size, drop_last=True)
 
