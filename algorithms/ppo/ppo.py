@@ -2,7 +2,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-import gym
 import time
 import scipy.signal
 from algorithms.ppo.core import ActorCritic, count_vars,average_gradients, \
@@ -385,7 +384,6 @@ def ppo(env_fn,
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='HalfCheetah-v2')
     parser.add_argument('--hid', type=int, default=64)
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)

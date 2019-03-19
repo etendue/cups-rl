@@ -73,16 +73,21 @@ class CNNRNNBase(nn.Module):
         self.rnn_state_size = output_size
         self.rnn = nn.GRUCell(self.rnn_input_size, self.rnn_state_size)
 
-    def forward(self, x, x_mask, h):
+    def forward(self, x, x_mask, h, horizon_t=32):
 
         # x has shape [T, batch,ch, w, h]
         # x_mask has shape [T,batch, 1]
-        # h has shape   [batch, hidden_state_size]
+        # h has shape   [T, batch, hidden_state_size]
 
         if len(x.size()) == 3:  # if batch forgotten, with 1 time step
             x = x.unsqueeze(0).unsqueeze(0)
             x_mask = x_mask.unsqueeze(0).unsqueeze(0)
-            h = h.unsqueeze(0)
+            h = h.unsqueeze(0).unsqueeze(0)
+
+        if len(x.size()) == 4:  # time horizon is given by horizon
+            x = x.view(horizon_t, -1, *x.size()[1:])
+            x_mask = x_mask.view(horizon_t, -1, 1)
+            h = h.view(horizon_t, -1, *h.size()[1:])
 
         T, batch_size, ch, w, h = x.size()
         # flatten the data to go through the CNN network
@@ -97,6 +102,7 @@ class CNNRNNBase(nn.Module):
         x = x.view(T, batch_size, self.rnn_input_size)
         outputs = []
 
+        h = h[0]  # use only the start state
         for t in range(T):
             out = h = self.gru(x[t], h * x_mask(t))
             outputs.append(out)
