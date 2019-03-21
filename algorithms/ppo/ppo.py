@@ -27,8 +27,8 @@ class PPOBuffer:
         self.ret_buf = np.zeros(size, dtype=np.float32)
         self.val_buf = np.zeros(size, dtype=np.float32)
         self.logp_buf = np.zeros(size, dtype=np.float32)
-        self.h_buf =np.zeros((size,memory_size), dtype=np.float32)
-        self.mask_buf = np.zeros(size, dtype = np.float32)
+        self.h_buf =np.zeros((size, memory_size), dtype=np.float32)
+        self.mask_buf = np.zeros(size, dtype=np.float32)
         self.gamma, self.lam = gamma, lam
         self.ptr, self.path_start_idx, self.max_size = 0, 0, size
 
@@ -331,7 +331,8 @@ def ppo(env_fn,
     for epoch in range(epochs):
         actor_critic.eval()
         for t in range(local_steps_per_epoch):
-            a, _, logp_t, v_t, h = actor_critic(Tensor(o), Tensor((1-d)), Tensor(h))
+            with torch.no_grad():
+                a, _, logp_t, v_t, h = actor_critic(Tensor(o), Tensor((1-d)), Tensor(h))
 
             # save and log
             buf.store(o, a.detach().numpy(), r, v_t.item(), logp_t.detach().numpy(), h, 1-d)
@@ -348,7 +349,8 @@ def ppo(env_fn,
                     print('Warning: trajectory cut off by epoch at %d steps.' %
                           ep_len)
                 # if trajectory didn't reach terminal state, bootstrap value target
-                last_val = r if d else actor_critic.value_function(Tensor(o), Tensor((1-d)), Tensor(h)).item()
+                with torch.no_grad():
+                    last_val = r if d else actor_critic.value_function(Tensor(o), Tensor((1-d)), Tensor(h)).item()
                 buf.finish_path(last_val)
                 if terminal:
                     # only save EpRet / EpLen if trajectory finished
