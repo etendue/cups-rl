@@ -73,7 +73,7 @@ class CNNRNNBase(nn.Module):
         self.rnn_state_size = output_size
         self.rnn = nn.GRUCell(self.rnn_input_size, self.rnn_state_size)
 
-    def forward(self, x, x_mask, h, horizon_t=32):
+    def forward(self, x, x_mask, h, horizon_t=1):
 
         # x has shape [batch,ch, w, h]
         # x_mask has shape [batch]
@@ -91,14 +91,16 @@ class CNNRNNBase(nn.Module):
 
         # convert back to time sequence for RNN cell
         x = x.view(horizon_t, -1, self.rnn_input_size)
+        x_mask = x_mask.view(horizon_t,-1,1)
+        h = h.view(horizon_t,-1, self.rnn_state_size)
         outputs = []
 
         h = h[0]  # use only the start state
-        for t in range(T):
-            out = h = self.gru(x[t], h * x_mask(t))
+        for t in range(horizon_t):
+            out = h = self.rnn(x[t], h * x_mask[t])
             outputs.append(out)
         outputs = torch.stack(outputs, dim=0)
-        return outputs.squeeze(), h.squeeze()
+        return outputs.view(-1,self.rnn_state_size), h.view(-1,self.rnn_state_size)
 
 
 class MLP(nn.Module):
@@ -167,31 +169,31 @@ class ActorCritic(nn.Module):
         )
 
         self.policy_ = CategoricalPolicy(
-                256,
+                memory_size,
                 hidden_sizes,
                 activation,
                 output_activation,
                 action_dim=action_space.n)
 
         self.value_function_ = MLP(
-            layers=[256] + list(hidden_sizes) + [1],
+            layers=[memory_size] + list(hidden_sizes) + [1],
             activation=activation,
             output_squeeze=True)
 
-    def forward(self, x, mask, h, a=None):
-        x, h = self.feature_base_(x, mask, h)
+    def forward(self, x, mask, h, a=None, horizon_t=1):
+        x, h = self.feature_base_(x, mask, h, horizon_t)
         pi, logp, logp_pi = self.policy_(x, a)
         v = self.value_function_(x)
 
         return pi, logp, logp_pi, v, h
 
-    def policy(self, x, mask, h, a=None):
-        x, h = self.feature_base_(x, mask, h)
+    def policy(self, x, mask, h, a=None, horizon_t=1 ):
+        x, h = self.feature_base_(x, mask, h, horizon_t)
         pi, logp, logp_pi = self.policy_(x, a)
         return pi, logp, logp_pi
 
-    def value_function(self, x, mask, h,):
-        x, h = self.feature_base_(x, mask, h)
+    def value_function(self, x, mask, h, horizon_t=1):
+        x, h = self.feature_base_(x, mask, h, horizon_t)
         v = self.value_function_(x)
         return v
 
