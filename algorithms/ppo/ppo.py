@@ -5,7 +5,7 @@ from torch import Tensor
 import time
 import scipy.signal
 from algorithms.ppo.core import ActorCritic, count_vars,average_gradients, \
-    sync_all_params,mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs, EpochLogger
+    sync_all_params,mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 from itertools import chain
 from  gym_ai2thor.envs.ai2thor_env import AI2ThorEnv
 
@@ -134,15 +134,13 @@ def ppo(env_fn,
         epochs=50,
         gamma=0.99,
         clip_ratio=0.2,
-        pi_lr=3e-4,
-        vf_lr=1e-3,
-        train_pi_iters=1,
-        train_v_iters=1,
+        lr=3e-4,
+        train_iters=1,
+        alpha=0.1,
+        beta=0.01,
         lam=0.97,
-        max_ep_len=1000,
         target_kl=0.01,
-        logger_kwargs=dict(),
-        save_freq=10):
+        save_freq=100):
     """
 
     Args:
@@ -189,27 +187,23 @@ def ppo(env_fn,
             can still go farther than the clip_ratio says, but it doesn't help
             on the objective anymore. (Usually small, 0.1 to 0.3.)
 
-        pi_lr (float): Learning rate for policy optimizer.
+        lr (float): Learning rate for  optimizer.
 
-        vf_lr (float): Learning rate for value function optimizer.
-
-        train_pi_iters (int): Maximum number of gradient descent steps to take
+        train_iters (int): Maximum number of gradient descent steps to take
             on policy loss per epoch. (Early stopping may cause optimizer
             to take fewer than this.)
 
-        train_v_iters (int): Number of gradient descent steps to take on
-            value function per epoch.
+        alpha (float) : ratio of loss objective for value
+
+        beta (float) : ratio of loss objective for entropy
 
         lam (float): Lambda for GAE-Lambda. (Always between 0 and 1,
             close to 1.)
 
-        max_ep_len (int): Maximum length of trajectory / episode / rollout.
 
         target_kl (float): Roughly what KL divergence we think is appropriate
             between new and old policies after an update. This will get used
             for early stopping. (Usually small, 0.01 or 0.05.)
-
-        logger_kwargs (dict): Keyword args for EpochLogger.
 
         save_freq (int): How often (in terms of gap between epochs) to save
             the current policy and value function.
@@ -218,9 +212,6 @@ def ppo(env_fn,
     # TODO: add this definition
     memory_size = 256
     horizon_t = 32
-
-    logger = EpochLogger(**logger_kwargs)
-    logger.save_config(locals())
 
     seed += 10000 * proc_id()
     torch.manual_seed(seed)
@@ -244,13 +235,10 @@ def ppo(env_fn,
     var_counts = tuple(
         count_vars(module)
         for module in [actor_critic.policy_, actor_critic.value_function_, actor_critic.feature_base_])
-    logger.log('\nNumber of parameters: \t pi: %d, \t v: %d \tbase: %d\n' % var_counts)
+    print('\nNumber of parameters: \t pi: %d, \t v: %d \tbase: %d\n' % var_counts)
 
     # Optimizers
-    train_pi = torch.optim.Adam(
-        chain(actor_critic.feature_base_.parameters(), actor_critic.policy_.parameters()), lr=pi_lr)
-    train_v = torch.optim.Adam(
-        chain(actor_critic.feature_base_.parameters(),actor_critic.value_function_.parameters()), lr=vf_lr)
+    optimizer = torch.optim.Adam(actor_critic.parameters(), lr=lr)
 
     # Sync params across processes
     sync_all_params(actor_critic.parameters())
@@ -259,137 +247,69 @@ def ppo(env_fn,
         obs, act, adv, ret, logp_old, h, mask = [torch.Tensor(x) for x in buf.get()]
 
         # Training policy
-        with torch.no_grad():
-            _, logp, _ = actor_critic.policy(obs, mask, h, act,horizon_t = horizon_t)
-            ratio = (logp - logp_old).exp()
-            min_adv = torch.where(adv > 0, (1 + clip_ratio) * adv,
-                              (1 - clip_ratio) * adv)
-            pi_l_old = -(torch.min(ratio * adv, min_adv)).mean()
-            ent = (-logp).mean()  # a sample estimate for entropy
 
-        for i in range(train_pi_iters):
+        for i in range(train_iters):
             # Output from policy function graph
-            _, logp, _ = actor_critic.policy(obs, mask, h, act,horizon_t = horizon_t)
+            x = actor_critic.process_feature(obs,mask,h,horizon_t)
+            _, logp_a, ent = actor_critic.policy(x)
+            v = actor_critic.value_function(x)
             # PPO policy objective
             ratio = (logp - logp_old).exp()
             min_adv = torch.where(adv > 0, (1 + clip_ratio) * adv,
                                   (1 - clip_ratio) * adv)
             pi_loss = -(torch.min(ratio * adv, min_adv)).mean()
 
-            # Policy gradient step
-            train_pi.zero_grad()
-            pi_loss.backward()
-            average_gradients(train_pi.param_groups)
-            train_pi.step()
-
-            with torch.no_grad():
-                _, logp, _ = actor_critic.policy(obs, mask, h, act,horizon_t = horizon_t)
-                kl = (logp_old - logp).mean()
-                kl = mpi_avg(kl.item())
-                if kl > 1.5 * target_kl:
-                    logger.log(
-                        'Early stopping at step %d due to reaching max kl.' % i)
-                    break
-        logger.store(StopIter=i)
-
-        # Training value function
-        with torch.no_grad():
-            v = actor_critic.value_function(obs, mask, h, horizon_t = horizon_t)
-            v_l_old = F.mse_loss(v, ret)
-        for _ in range(train_v_iters):
-            # Output from value function graph
-            v = actor_critic.value_function(obs, mask, h, horizon_t = horizon_t)
-            # PPO value function objective
+            # PPO value objective
             v_loss = F.mse_loss(v, ret)
 
-            # Value function gradient step
-            train_v.zero_grad()
-            v_loss.backward()
-            average_gradients(train_v.param_groups)
-            train_v.step()
+            kl = (logp_old - logp_a).mean().detach()
+            kl = mpi_avg(kl.item())
+            if kl > 1.5 * target_kl:
+                print('Early stopping at step %d due to reaching max kl.' % i)
+                break
 
-        # Log changes from update
-        actor_critic.eval()
-        with torch.no_grad():
-            _, logp, _, v ,_ = actor_critic(obs, mask, h, act, horizon_t=horizon_t)
-            ratio = (logp - logp_old).exp()
-            min_adv = torch.where(adv > 0, (1 + clip_ratio) * adv,
-                              (1 - clip_ratio) * adv)
-            pi_l_new = -(torch.min(ratio * adv, min_adv)).mean()
-            v_l_new = F.mse_loss(v, ret)
-            kl = (logp_old - logp).mean()  # a sample estimate for KL-divergence
-            clipped = (ratio > (1 + clip_ratio)) | (ratio < (1 - clip_ratio))
-            cf = (clipped.float()).mean()
-
-        logger.store(
-            LossPi=pi_l_old,
-            LossV=v_l_old,
-            KL=kl,
-            Entropy=ent,
-            ClipFrac=cf,
-            DeltaLossPi=(pi_l_new - pi_l_old),
-            DeltaLossV=(v_l_new - v_l_old))
+            # Policy gradient step
+            optimizer.zero_grad()
+            (pi_loss + v_loss * alpha - ent.mean()*beta).backward()
+            average_gradients(optimizer.param_groups)
+            optimizer.step()
 
     start_time = time.time()
-    o, r, d, ep_ret, ep_len, h = env.reset()/255., 0, False, 0, 0, np.zeros(memory_size, dtype=float)
-    o = o.reshape(*obs_dim)
+
+    d, ep_ret, cum_ret = False, 0, 0
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         actor_critic.eval()
         for t in range(local_steps_per_epoch):
-            with torch.no_grad():
-                mask = 0. if d else 1.
-                a, _, logp_t, v_t, h = actor_critic(Tensor(o), Tensor([mask]), Tensor(h))
 
-            # save and log
-            buf.store(o, a.detach().numpy(), r, v_t.item(), logp_t.detach().numpy(), h, mask)
-            logger.store(VVals=v_t)
-
-            o, r, d, _ = env.step(a.detach().numpy()[0])
-            o = (o/255.).reshape(*obs_dim)
-            ep_ret += r
-            ep_len += 1
-
-            terminal = d or (ep_len == max_ep_len)
-            if terminal or (t == local_steps_per_epoch - 1):
-                if not (terminal):
-                    print('Warning: trajectory cut off by epoch at %d steps.' %
-                          ep_len)
-                # if trajectory didn't reach terminal state, bootstrap value target
-                with torch.no_grad():
-                    last_val = r if d else actor_critic.value_function(Tensor(o), Tensor((1-d)), Tensor(h)).item()
-                buf.finish_path(last_val)
-                if terminal:
-                    # only save EpRet / EpLen if trajectory finished
-                    logger.store(EpRet=ep_ret, EpLen=ep_len)
-                o, r, d, ep_ret, ep_len = env.reset()/255., 0, False, 0, 0
+            if d:
+                ep_ret = cum_ret
+                o,  d, cum_ret, h = env.reset()/255., False, 0, np.zeros(memory_size, dtype=float)
                 o = o.reshape(*obs_dim)
 
-        # Save model
-        if (epoch % save_freq == 0) or (epoch == epochs - 1):
-            logger.save_state({'env': env}, actor_critic, None)
+            with torch.no_grad():
+                mask = 0. if d else 1.
+                a_t, logp_t, _, v_t, h = actor_critic(Tensor(o), Tensor([mask]), Tensor(h))
+
+            # save and log
+            buf.store(o, a_t.detach().numpy(), r, v_t.item(), logp_t.numpy(), h, mask)
+
+            o, r, d, _ = env.step(a_t.detach().numpy()[0])
+            o = (o/255.).reshape(*obs_dim)
+            cum_ret += r
+
+        with torch.no_grad():
+            last_val = r if d else actor_critic.value_function(Tensor(o), Tensor((1 - d)), Tensor(h)).item()
+
+        buf.finish_path(last_val)
+        # Save model TODO
 
         # Perform PPO update!
         actor_critic.train()
         update()
 
         print("FPS: %d"%((epoch+1)*steps_per_epoch//(time.time()- start_time)))
-        # Log info about epoch
-        logger.log_tabular('Epoch', epoch)
-        #logger.log_tabular('EpRet', with_min_and_max=True)
-        #logger.log_tabular('EpLen', average_only=True)
-        logger.log_tabular('VVals', with_min_and_max=True)
-        #logger.log_tabular('TotalEnvInteracts', (epoch + 1) * steps_per_epoch)
-        logger.log_tabular('LossPi', average_only=True)
-        logger.log_tabular('LossV', average_only=True)
-        logger.log_tabular('DeltaLossPi', average_only=True)
-        logger.log_tabular('DeltaLossV', average_only=True)
-        logger.log_tabular('Entropy', average_only=True)
-        logger.log_tabular('KL', average_only=True)
-        logger.log_tabular('ClipFrac', average_only=True)
-        logger.log_tabular('StopIter', average_only=True)
-        logger.log_tabular('Time', time.time() - start_time)
-        logger.dump_tabular()
+        # Log info about epoch TODO
 
 
 if __name__ == '__main__':
@@ -407,8 +327,6 @@ if __name__ == '__main__':
 
     mpi_fork(args.cpu)  # run parallel code with mpi
 
-    from  algorithms.ppo.core import setup_logger_kwargs
-    logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
     ppo(AI2ThorEnv,
         actor_critic=ActorCritic,
@@ -416,5 +334,4 @@ if __name__ == '__main__':
         gamma=args.gamma,
         seed=args.seed,
         steps_per_epoch=args.steps,
-        epochs=args.epochs,
-        logger_kwargs=logger_kwargs)
+        epochs=args.epochs)
