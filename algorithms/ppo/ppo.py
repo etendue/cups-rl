@@ -8,6 +8,8 @@ from algorithms.ppo.core import ActorCritic, count_vars,average_gradients, \
     sync_all_params,mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 from itertools import chain
 from  gym_ai2thor.envs.ai2thor_env import AI2ThorEnv
+from tensorboardX import SummaryWriter
+
 
 
 class PPOBuffer:
@@ -155,14 +157,14 @@ def ppo(env_fn,
             ===========  ================  ======================================
             Symbol       Shape             Description
             ===========  ================  ======================================
-            ``pi``       (batch, act_dim)  | Samples actions from policy given
+            ``a``       (batch, act_dim)  | Samples actions from policy given
                                            | states.
-            ``logp``     (batch,)          | Gives log probability, according to
+            ``logp_a``     (batch,)          | Gives log probability, according to
                                            | the policy, of taking actions ``a``
                                            | in states ``x``.
-            ``logp_pi``  (batch,)          | Gives log probability, according to
-                                           | the policy, of the action sampled by
-                                           | ``pi``.
+            ``ent``      (batch,)          | Entropy of probablity, according to
+                                           | the policy
+                                           |
             ``v``        (batch,)          | Gives the value estimate for states
                                            | in ``x``. (Critical: make sure
                                            | to flatten this via .squeeze()!)
@@ -227,6 +229,9 @@ def ppo(env_fn,
     # Main model
     actor_critic = actor_critic(in_features=obs_dim, **ac_kwargs)
 
+    if torch.cuda.is_available():
+        actor_critic.to('cuda')
+
     # Experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
     buf = PPOBuffer(obs_dim, act_dim, local_steps_per_epoch, memory_size, gamma, lam)
@@ -247,21 +252,19 @@ def ppo(env_fn,
         obs, act, adv, ret, logp_old, h, mask = [torch.Tensor(x) for x in buf.get()]
 
         # Training policy
-
         for i in range(train_iters):
             # Output from policy function graph
             x = actor_critic.process_feature(obs,mask,h,horizon_t)
             _, logp_a, ent = actor_critic.policy(x)
             v = actor_critic.value_function(x)
             # PPO policy objective
-            ratio = (logp - logp_old).exp()
+            ratio = (logp_a - logp_old).exp()
             min_adv = torch.where(adv > 0, (1 + clip_ratio) * adv,
                                   (1 - clip_ratio) * adv)
             pi_loss = -(torch.min(ratio * adv, min_adv)).mean()
-
             # PPO value objective
             v_loss = F.mse_loss(v, ret)
-
+            # KL divergence
             kl = (logp_old - logp_a).mean().detach()
             kl = mpi_avg(kl.item())
             if kl > 1.5 * target_kl:
@@ -275,33 +278,44 @@ def ppo(env_fn,
             optimizer.step()
 
     start_time = time.time()
-
-    d, ep_ret, cum_ret = False, 0, 0
+    ep_ret = 0
+    o, d, cum_ret, h = env.reset() / 255., False, 0, np.zeros(memory_size, dtype=float)
+    mask = 0. if d else 1.
+    o = o.reshape(*obs_dim)
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         actor_critic.eval()
         for t in range(local_steps_per_epoch):
-
-            if d:
-                ep_ret = cum_ret
-                o,  d, cum_ret, h = env.reset()/255., False, 0, np.zeros(memory_size, dtype=float)
-                o = o.reshape(*obs_dim)
-
             with torch.no_grad():
-                mask = 0. if d else 1.
                 a_t, logp_t, _, v_t, h = actor_critic(Tensor(o), Tensor([mask]), Tensor(h))
 
-            # save and log
-            buf.store(o, a_t.detach().numpy(), r, v_t.item(), logp_t.numpy(), h, mask)
+            # save experience
+            buf.store(o,
+                      a_t.cpu().data.numpy(),
+                      r,
+                      v_t.cpu().data.numpy(),
+                      logp_t.cpu().data.numpy(),
+                      h.cpu().data.numpy(),
+                      mask)
 
-            o, r, d, _ = env.step(a_t.detach().numpy()[0])
+            o, r, d, _ = env.step(a_t.cpu().data.numpy().item())
             o = (o/255.).reshape(*obs_dim)
+            mask = 0. if d else 1.
             cum_ret += r
 
-        with torch.no_grad():
-            last_val = r if d else actor_critic.value_function(Tensor(o), Tensor((1 - d)), Tensor(h)).item()
+            if d: # calculate the returns and GAE and reset environment
+                buf.finish_path(0.)
+                ep_ret = cum_ret
+                o, d, cum_ret, h = env.reset() / 255., False, 0, np.zeros(memory_size, dtype=float)
+                o = o.reshape(*obs_dim)
+                mask = 0. if d else 1.
 
-        buf.finish_path(last_val)
+        # environment does not end
+        if not d:
+            with torch.no_grad():
+                x, _ = actor_critic(Tensor(0),Tensor(mask), Tensor(h))
+                last_val = actor_critic.value_function(x).cpu().data.numpy()[0]
+            buf.finish_path(last_val)
         # Save model TODO
 
         # Perform PPO update!
