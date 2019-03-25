@@ -6,10 +6,13 @@ import time
 import scipy.signal
 from algorithms.ppo.core import ActorCritic, count_vars,average_gradients, \
     sync_all_params,mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
-from itertools import chain
 from  gym_ai2thor.envs.ai2thor_env import AI2ThorEnv
 from tensorboardX import SummaryWriter
 
+
+def log_info(msg):
+    if proc_id() == 0:
+        print(msg)
 
 
 class PPOBuffer:
@@ -142,7 +145,8 @@ def ppo(env_fn,
         beta=0.01,
         lam=0.97,
         target_kl=0.01,
-        save_freq=100):
+        save_freq=10,
+        model_path=None):
     """
 
     Args:
@@ -210,9 +214,12 @@ def ppo(env_fn,
         save_freq (int): How often (in terms of gap between epochs) to save
             the current policy and value function.
 
+        model_path(str): path to load saved model
+
     """
-    # TODO: add this definition
+    # the memory_size for RNN hidden state
     memory_size = 256
+    # time horizon length for RNN
     horizon_t = 32
 
     seed += 10000 * proc_id()
@@ -229,8 +236,12 @@ def ppo(env_fn,
     # Main model
     actor_critic = actor_critic(in_features=obs_dim, **ac_kwargs)
 
+    if model_path:
+        actor_critic.load_state_dict(torch.load(model_path))
+
     if torch.cuda.is_available():
-        actor_critic.to('cuda')
+        device = torch.device('cuda')
+        actor_critic.to(device)
 
     # Experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
@@ -240,13 +251,17 @@ def ppo(env_fn,
     var_counts = tuple(
         count_vars(module)
         for module in [actor_critic.policy_, actor_critic.value_function_, actor_critic.feature_base_])
-    print('\nNumber of parameters: \t pi: %d, \t v: %d \tbase: %d\n' % var_counts)
+    log_info('\nNumber of parameters: \t pi: %d, \t v: %d \tbase: %d\n' % var_counts)
 
     # Optimizers
     optimizer = torch.optim.Adam(actor_critic.parameters(), lr=lr)
 
     # Sync params across processes
     sync_all_params(actor_critic.parameters())
+
+    # add TensorBoard
+    if proc_id() == 0:
+        writer = SummaryWriter(comment="ai2thor_pp")
 
     def update():
         obs, act, adv, ret, logp_old, h, mask = [torch.Tensor(x) for x in buf.get()]
@@ -264,27 +279,39 @@ def ppo(env_fn,
             pi_loss = -(torch.min(ratio * adv, min_adv)).mean()
             # PPO value objective
             v_loss = F.mse_loss(v, ret)
+            # PPO entropy objective
+            entropy = ent.mean()
             # KL divergence
             kl = (logp_old - logp_a).mean().detach()
             kl = mpi_avg(kl.item())
             if kl > 1.5 * target_kl:
-                print('Early stopping at step %d due to reaching max kl.' % i)
+                log_info('Early stopping at step %d due to reaching max kl.' % i)
                 break
 
             # Policy gradient step
             optimizer.zero_grad()
-            (pi_loss + v_loss * alpha - ent.mean()*beta).backward()
+            (pi_loss + v_loss * alpha - entropy*beta).backward()
             average_gradients(optimizer.param_groups)
             optimizer.step()
 
+        # Log info about epoch TODO
+        if proc_id() == 0:
+            global_steps = epoch * steps_per_epoch
+            writer.add_scalar("Entropy", entropy, global_steps)
+            writer.add_scalar("p_loss", pi_loss, global_steps)
+            writer.add_scalar("v_loss", v_loss, global_steps)
+
     start_time = time.time()
-    ep_ret = 0
+
     o, d, cum_ret, h = env.reset() / 255., False, 0, np.zeros(memory_size, dtype=float)
     mask = 0. if d else 1.
     o = o.reshape(*obs_dim)
+    ep_ret = 0
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
+        epoch_start = time.time()
         actor_critic.eval()
+
         for t in range(local_steps_per_epoch):
             with torch.no_grad():
                 a_t, logp_t, _, v_t, h = actor_critic(Tensor(o), Tensor([mask]), Tensor(h))
@@ -316,14 +343,24 @@ def ppo(env_fn,
                 x, _ = actor_critic(Tensor(0),Tensor(mask), Tensor(h))
                 last_val = actor_critic.value_function(x).cpu().data.numpy()[0]
             buf.finish_path(last_val)
-        # Save model TODO
 
+        eval_stop = time.time()
         # Perform PPO update!
         actor_critic.train()
         update()
+        opti_stop = time.time()
 
-        print("FPS: %d"%((epoch+1)*steps_per_epoch//(time.time()- start_time)))
-        # Log info about epoch TODO
+        train_time = (opti_stop - eval_stop)/(opti_stop-epoch_start)
+        fps = (epoch+1)*steps_per_epoch//(opti_stop - start_time)
+        log_info(f"FPS: ({fps}), training time ({int(train_time*100)})%")
+
+        epoch_ret = mpi_avg(ep_ret)
+        if proc_id() == 0:
+            global_steps = epoch * steps_per_epoch
+            writer.add_scalar("Return", epoch_ret, global_steps)
+            # Save model
+            if epoch % save_freq == 0:
+                torch.save(actor_critic.cpu().state_dict(),"model/ppo.pt")
 
 
 if __name__ == '__main__':
@@ -337,6 +374,7 @@ if __name__ == '__main__':
     parser.add_argument('--steps', type=int, default=512)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--exp_name', type=str, default='ppo')
+    parser.add_argument('--model-path', type=str, default=None)
     args = parser.parse_args()
 
     mpi_fork(args.cpu)  # run parallel code with mpi
@@ -348,4 +386,5 @@ if __name__ == '__main__':
         gamma=args.gamma,
         seed=args.seed,
         steps_per_epoch=args.steps,
-        epochs=args.epochs)
+        epochs=args.epochs,
+        model_path=args.model_path)
