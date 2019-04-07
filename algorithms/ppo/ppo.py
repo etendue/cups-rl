@@ -5,9 +5,10 @@ from torch import Tensor
 import time
 import scipy.signal
 from algorithms.ppo.core import ActorCritic, count_vars,average_gradients, \
-    sync_all_params,mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
+    sync_all_params,mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs,mpi_sum
 from  gym_ai2thor.envs.ai2thor_env import AI2ThorEnv
 from tensorboardX import SummaryWriter
+from collections import deque
 
 
 def log_info(msg):
@@ -26,7 +27,7 @@ class PPOBuffer:
         self.obs_buf = np.zeros(
             self._combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(
-            self._combined_shape(size, act_dim), dtype=np.float32)
+            self._combined_shape(size), dtype=np.float32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
         self.ret_buf = np.zeros(size, dtype=np.float32)
@@ -140,7 +141,7 @@ def ppo(env_fn,
         gamma=0.99,
         clip_ratio=0.2,
         lr=3e-4,
-        train_iters=1,
+        train_iters=40,
         alpha=0.1,
         beta=0.01,
         lam=0.97,
@@ -220,7 +221,7 @@ def ppo(env_fn,
     # the memory_size for RNN hidden state
     memory_size = 256
     # time horizon length for RNN
-    horizon_t = 32
+    horizon_t = 20
 
     seed += 10000 * proc_id()
     torch.manual_seed(seed)
@@ -236,12 +237,15 @@ def ppo(env_fn,
     # Main model
     actor_critic = actor_critic(in_features=obs_dim, **ac_kwargs)
 
-    if model_path:
-        actor_critic.load_state_dict(torch.load(model_path))
-
     if torch.cuda.is_available():
         device = torch.device('cuda')
-        actor_critic.to(device)
+    else:
+        device = torch.device('cpu')
+
+    if model_path:
+        actor_critic.load_state_dict(torch.load(model_path),map_location=device)
+
+    actor_critic.to(device)
 
     # Experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
@@ -250,27 +254,27 @@ def ppo(env_fn,
     # Count variables
     var_counts = tuple(
         count_vars(module)
-        for module in [actor_critic.policy_, actor_critic.value_function_, actor_critic.feature_base_])
+        for module in [actor_critic.policy, actor_critic.value_function, actor_critic.feature_base])
     log_info('\nNumber of parameters: \t pi: %d, \t v: %d \tbase: %d\n' % var_counts)
 
     # Optimizers
     optimizer = torch.optim.Adam(actor_critic.parameters(), lr=lr)
 
     # Sync params across processes
-    sync_all_params(actor_critic.parameters())
+    sync_all_params(actor_critic.parameters(),device=device)
 
     # add TensorBoard
     if proc_id() == 0:
         writer = SummaryWriter(comment="ai2thor_pp")
 
     def update():
-        obs, act, adv, ret, logp_old, h, mask = [torch.Tensor(x) for x in buf.get()]
+        obs, act, adv, ret, logp_old, h, mask = [Tensor(x).to(device) for x in buf.get()]
 
         # Training policy
         for i in range(train_iters):
             # Output from policy function graph
-            x = actor_critic.process_feature(obs,mask,h,horizon_t)
-            _, logp_a, ent = actor_critic.policy(x)
+            x,_ = actor_critic.process_feature(obs,mask,h,horizon_t)
+            _, logp_a, ent = actor_critic.policy(x,act)
             v = actor_critic.value_function(x)
             # PPO policy objective
             ratio = (logp_a - logp_old).exp()
@@ -303,10 +307,12 @@ def ppo(env_fn,
 
     start_time = time.time()
 
-    o, d, cum_ret, h = env.reset() / 255., False, 0, np.zeros(memory_size, dtype=float)
+    o, d, r, cum_ret= env.reset() / 255., False, 0, 0.
     mask = 0. if d else 1.
+    h_t = torch.zeros(memory_size).to(device)
     o = o.reshape(*obs_dim)
-    ep_ret = 0
+    ep_ret = deque(maxlen=5)
+    ep_ret.append(0.)
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         epoch_start = time.time()
@@ -314,34 +320,40 @@ def ppo(env_fn,
 
         for t in range(local_steps_per_epoch):
             with torch.no_grad():
-                a_t, logp_t, _, v_t, h = actor_critic(Tensor(o), Tensor([mask]), Tensor(h))
+                o_t = Tensor(o).to(device)
+                mask_t = Tensor([mask]).to(device)
+                a_t, logp_t, _, v_t, h_t_next = actor_critic(o_t,mask_t,h_t)
 
             # save experience
             buf.store(o,
-                      a_t.cpu().data.numpy(),
+                      a_t.data.item(),
                       r,
-                      v_t.cpu().data.numpy(),
-                      logp_t.cpu().data.numpy(),
-                      h.cpu().data.numpy(),
+                      v_t.data.item(),
+                      logp_t.data.item(),
+                      h_t.cpu().data.numpy(),
                       mask)
 
-            o, r, d, _ = env.step(a_t.cpu().data.numpy().item())
+            h_t = h_t_next
+            o, r, d, _ = env.step(a_t.data.item())
             o = (o/255.).reshape(*obs_dim)
             mask = 0. if d else 1.
             cum_ret += r
 
             if d: # calculate the returns and GAE and reset environment
                 buf.finish_path(0.)
-                ep_ret = cum_ret
-                o, d, cum_ret, h = env.reset() / 255., False, 0, np.zeros(memory_size, dtype=float)
+                ep_ret.append(cum_ret)
+                o, d, r, cum_ret= env.reset() / 255., False, 0, 0.
+                h_t = torch.zeros(memory_size).to(device)
                 o = o.reshape(*obs_dim)
                 mask = 0. if d else 1.
 
         # environment does not end
         if not d:
             with torch.no_grad():
-                x, _ = actor_critic(Tensor(0),Tensor(mask), Tensor(h))
-                last_val = actor_critic.value_function(x).cpu().data.numpy()[0]
+                o_t = Tensor(o).to(device)
+                mask_t = Tensor([mask]).to(device)
+                x, _ = actor_critic.process_feature(o_t,mask_t, h_t)
+                last_val = actor_critic.value_function(x).data.item()
             buf.finish_path(last_val)
 
         eval_stop = time.time()
@@ -352,15 +364,16 @@ def ppo(env_fn,
 
         train_time = (opti_stop - eval_stop)/(opti_stop-epoch_start)
         fps = (epoch+1)*steps_per_epoch//(opti_stop - start_time)
-        log_info(f"FPS: ({fps}), training time ({int(train_time*100)})%")
+        epoch_ret_sum, epoch_ret_count = mpi_sum([np.sum(ep_ret), len(ep_ret)])
+        avg_ret = epoch_ret_sum/epoch_ret_count
+        log_info(f"Episode({epoch}) FPS: ({fps}), training time ({int(train_time*100)})%, avg return({avg_ret})")
 
-        epoch_ret = mpi_avg(ep_ret)
         if proc_id() == 0:
-            global_steps = epoch * steps_per_epoch
-            writer.add_scalar("Return", epoch_ret, global_steps)
+            global_steps = (epoch+1) * steps_per_epoch
+            writer.add_scalar("Return", avg_ret, global_steps)
             # Save model
             if epoch % save_freq == 0:
-                torch.save(actor_critic.cpu().state_dict(),"model/ppo.pt")
+                torch.save(actor_critic.state_dict(),"model_ppo.pt")
 
 
 if __name__ == '__main__':
@@ -371,7 +384,7 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--cpu', type=int, default=1)
-    parser.add_argument('--steps', type=int, default=512)
+    parser.add_argument('--steps', type=int, default=2000)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--exp_name', type=str, default='ppo')
     parser.add_argument('--model-path', type=str, default=None)

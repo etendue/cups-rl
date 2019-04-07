@@ -137,7 +137,7 @@ class CategoricalPolicy(nn.Module):
     def forward(self, x, a=None):
         policy = Categorical(logits=self.logits(x))
         if a is None:
-            a = policy.sample()
+            a = policy.sample().squeeze()
         logp_a = policy.log_prob(a).squeeze()
         return a, logp_a, policy.entropy()
 
@@ -152,7 +152,7 @@ class ActorCritic(nn.Module):
                  output_activation=None):
         super(ActorCritic, self).__init__()
 
-        self.feature_base_ = CNNRNNBase(
+        self.feature_base = CNNRNNBase(
             input_shape=in_features,
             output_size=memory_size
         )
@@ -167,18 +167,18 @@ class ActorCritic(nn.Module):
         self.value_function = MLP(
             layers=[memory_size] + list(hidden_sizes) + [1],
             activation=activation,
-            output_squeeze=True)
+            output_squeeze= True)
 
         self.rnn_out, self.rnn_out_last = None, None
 
     def forward(self, x, mask, h, a=None, horizon_t=1):
-        x, h = self.feature_base_(x, mask, h, horizon_t)
+        x, h = self.feature_base(x, mask, h, horizon_t)
         a, logp_a, ent = self.policy(x, a)
-        v = self.value_function(x)
+        v = self.value_function(x).squeeze(dim=-1)
         return a, logp_a, ent, v, h
 
     def process_feature(self, x, mask, h, horizon_t=1):
-        self.rnn_out, self.rnn_out_last = self.feature_base_(x, mask, h, horizon_t)
+        self.rnn_out, self.rnn_out_last = self.feature_base(x, mask, h, horizon_t)
         return self.rnn_out, self.rnn_out_last
 
 
@@ -279,14 +279,14 @@ def mpi_statistics_scalar(x, with_min_and_max=False):
     return mean, std
 
 
-def sync_all_params(param, root=0):
-    data = torch.nn.utils.parameters_to_vector(param).detach().numpy()
+def sync_all_params(param, root=0, device=torch.device("cpu")):
+    data = torch.nn.utils.parameters_to_vector(param).cpu().detach().numpy()
     broadcast(data, root)
-    torch.nn.utils.vector_to_parameters(torch.from_numpy(data), param)
+    torch.nn.utils.vector_to_parameters(torch.from_numpy(data).to(device), param)
 
 
-def average_gradients(param_groups):
+def average_gradients(param_groups, device=torch.device("cpu")):
     for param_group in param_groups:
         for p in param_group['params']:
             if p.requires_grad:
-                p.grad.data.copy_(torch.Tensor(mpi_avg(p.grad.data.numpy())))
+                p.grad.data.copy_(torch.Tensor(mpi_avg(p.grad.cpu().data.numpy())).to(device))
