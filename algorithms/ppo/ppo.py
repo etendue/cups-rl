@@ -103,11 +103,12 @@ class PPOBuffer:
         the buffer, with advantages appropriately normalized (shifted to have
         mean zero and std one). Also, resets some pointers in the buffer.
         """
-        assert self.ptr == self.max_size  # buffer has to be full before you can get
-        self.ptr, self.path_start_idx = 0, 0
-        # the next two lines implement the advantage normalization trick
-        adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
-        self.adv_buf = (self.adv_buf - adv_mean) / adv_std
+        if self.ptr != 0:
+            assert self.ptr == self.max_size  # buffer has to be full before you can get
+            self.ptr, self.path_start_idx = 0, 0
+            # the next two lines implement the advantage normalization trick
+            adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
+            self.adv_buf = (self.adv_buf - adv_mean) / adv_std
 
         #assert self.max_size%batch_size == 0 # better to utilize all the experience
         #assert batch_size%time_horizon == 0
@@ -297,7 +298,7 @@ def ppo(env_fn,
 
         # Training policy
         for i in range(train_iters):
-            batch_gen = buf.get_batch(batch_gen,horizon_t)
+            batch_gen = buf.get_batch(batch_size,horizon_t)
             kl_batches = []
             ent_batches = []
             pi_loss_batches=[]
@@ -334,7 +335,7 @@ def ppo(env_fn,
 
             kl = mpi_avg(np.mean(kl_batches))
             if kl > 1.5 * target_kl:
-                log_info('Early stopping at step %d due to reaching max kl.' % i)
+                log_info(f'Early stopping at step ({i}) due to reaching max kl. ({kl:.4})')
                 break
 
         ent_avg = mpi_avg(np.mean(ent_batches))
@@ -342,6 +343,7 @@ def ppo(env_fn,
         v_loss_avg = mpi_avg(np.mean(v_loss_batches))
         # Log info about epoch TODO
         if proc_id() == 0:
+            writer.add_scalar("KL", kl, global_steps)
             writer.add_scalar("Entropy", ent_avg, global_steps)
             writer.add_scalar("p_loss", pi_loss_avg, global_steps)
             writer.add_scalar("v_loss", v_loss_avg, global_steps)
@@ -368,7 +370,7 @@ def ppo(env_fn,
             kl = (logp_old - logp_a).mean().detach()
             kl = mpi_avg(kl.item())
             if kl > 1.5 * target_kl:
-                log_info('Early stopping at step %d due to reaching max kl.' % i)
+                log_info(f'Early stopping at step ({i}) due to reaching max kl. ({kl:.4})')
                 break
 
             # Policy gradient step
@@ -379,6 +381,7 @@ def ppo(env_fn,
 
         # Log info about epoch TODO
         if proc_id() == 0:
+            writer.add_scalar("KL",kl,global_steps)
             writer.add_scalar("Entropy", entropy, global_steps)
             writer.add_scalar("p_loss", pi_loss, global_steps)
             writer.add_scalar("v_loss", v_loss, global_steps)
@@ -464,7 +467,7 @@ if __name__ == '__main__':
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--cpu', type=int, default=1)
+    parser.add_argument('--cpu', type=int, default=2)
     parser.add_argument('--steps', type=int, default=2000)
     parser.add_argument('--batch-size', type=int, default=500)
     parser.add_argument('--epochs', type=int, default=50)
