@@ -26,8 +26,7 @@ class PPOBuffer:
     def __init__(self, obs_dim, act_dim, size, memory_size, gamma=0.99, lam=0.95):
         self.obs_buf = np.zeros(
             self._combined_shape(size, obs_dim), dtype=np.float32)
-        self.act_buf = np.zeros(
-            self._combined_shape(size), dtype=np.float32)
+        self.act_buf = np.zeros(size, dtype=np.float32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
         self.ret_buf = np.zeros(size, dtype=np.float32)
@@ -97,6 +96,32 @@ class PPOBuffer:
             self.obs_buf, self.act_buf, self.adv_buf, self.ret_buf,
             self.logp_buf, self.h_buf, self.mask_buf
         ]
+
+    def get_batch(self, batch_size, time_horizon):
+        """
+        Call this at the end of an epoch to get all of the data from
+        the buffer, with advantages appropriately normalized (shifted to have
+        mean zero and std one). Also, resets some pointers in the buffer.
+        """
+        assert self.ptr == self.max_size  # buffer has to be full before you can get
+        self.ptr, self.path_start_idx = 0, 0
+        # the next two lines implement the advantage normalization trick
+        adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
+        self.adv_buf = (self.adv_buf - adv_mean) / adv_std
+
+        #assert self.max_size%batch_size == 0 # better to utilize all the experience
+        #assert batch_size%time_horizon == 0
+
+        num_batch = self.max_size//batch_size
+        num_block = self.max_size//time_horizon
+        indice = np.random.permutation(num_block).reshape(num_batch, -1)
+
+        for idx in indice:
+            sl = np.hstack([np.arange(i, i+time_horizon) for i in idx])
+            yield [
+                self.obs_buf[sl], self.act_buf[sl], self.adv_buf[sl], self.ret_buf[sl],
+                self.logp_buf[sl], self.h_buf[sl], self.mask_buf[sl]
+            ]
 
     def _combined_shape(self, length, shape=None):
         if shape is None:
@@ -222,6 +247,7 @@ def ppo(env_fn,
     memory_size = 256
     # time horizon length for RNN
     horizon_t = 20
+    batch_size = args.batch_size
 
     seed += 10000 * proc_id()
     torch.manual_seed(seed)
@@ -267,6 +293,59 @@ def ppo(env_fn,
     if proc_id() == 0:
         writer = SummaryWriter(comment="ai2thor_pp")
 
+    def update_with_batch():
+
+        # Training policy
+        for i in range(train_iters):
+            batch_gen = buf.get_batch(batch_gen,horizon_t)
+            kl_batches = []
+            ent_batches = []
+            pi_loss_batches=[]
+            v_loss_batches=[]
+            for batch in batch_gen:
+                obs, act, adv, ret, logp_old, h, mask = [Tensor(x).to(device) for x in batch]
+                # Output from policy function graph
+                x, _ = actor_critic.process_feature(obs, mask, h, horizon_t)
+                _, logp_a, ent = actor_critic.policy(x, act)
+                v = actor_critic.value_function(x)
+                # PPO policy objective
+                ratio = (logp_a - logp_old).exp()
+                min_adv = torch.where(adv > 0, (1 + clip_ratio) * adv,
+                                  (1 - clip_ratio) * adv)
+                pi_loss = -(torch.min(ratio * adv, min_adv)).mean()
+                # PPO value objective
+                v_loss = F.mse_loss(v, ret)
+                # PPO entropy objective
+                entropy = ent.mean()
+
+                # Policy gradient step
+                optimizer.zero_grad()
+                (pi_loss + v_loss * alpha - entropy * beta).backward()
+                average_gradients(optimizer.param_groups)
+                optimizer.step()
+
+                # KL divergence
+                kl = (logp_old - logp_a).mean().detach()
+
+                kl_batches.append(kl.data.item())
+                ent_batches.append(entropy.data.item())
+                pi_loss_batches.append(pi_loss.data.item())
+                v_loss_batches.append(v_loss.data.item())
+
+            kl = mpi_avg(np.mean(kl_batches))
+            if kl > 1.5 * target_kl:
+                log_info('Early stopping at step %d due to reaching max kl.' % i)
+                break
+
+        ent_avg = mpi_avg(np.mean(ent_batches))
+        pi_loss_avg = mpi_avg(np.mean(pi_loss_batches))
+        v_loss_avg = mpi_avg(np.mean(v_loss_batches))
+        # Log info about epoch TODO
+        if proc_id() == 0:
+            writer.add_scalar("Entropy", ent_avg, global_steps)
+            writer.add_scalar("p_loss", pi_loss_avg, global_steps)
+            writer.add_scalar("v_loss", v_loss_avg, global_steps)
+
     def update():
         obs, act, adv, ret, logp_old, h, mask = [Tensor(x).to(device) for x in buf.get()]
 
@@ -300,7 +379,6 @@ def ppo(env_fn,
 
         # Log info about epoch TODO
         if proc_id() == 0:
-            global_steps = epoch * steps_per_epoch
             writer.add_scalar("Entropy", entropy, global_steps)
             writer.add_scalar("p_loss", pi_loss, global_steps)
             writer.add_scalar("v_loss", v_loss, global_steps)
@@ -356,20 +434,23 @@ def ppo(env_fn,
                 last_val = actor_critic.value_function(x).data.item()
             buf.finish_path(last_val)
 
+        global_steps = (epoch + 1) * steps_per_epoch
         eval_stop = time.time()
         # Perform PPO update!
         actor_critic.train()
-        update()
+        if batch_size != -1:
+            update_with_batch()
+        else:
+            update()
         opti_stop = time.time()
 
         train_time = (opti_stop - eval_stop)/(opti_stop-epoch_start)
-        fps = (epoch+1)*steps_per_epoch//(opti_stop - start_time)
+        fps = global_steps//(opti_stop - start_time)
         epoch_ret_sum, epoch_ret_count = mpi_sum([np.sum(ep_ret), len(ep_ret)])
         avg_ret = epoch_ret_sum/epoch_ret_count
         log_info(f"Episode({epoch}) FPS: ({fps}), training time ({int(train_time*100)})%, avg return({avg_ret})")
 
         if proc_id() == 0:
-            global_steps = (epoch+1) * steps_per_epoch
             writer.add_scalar("Return", avg_ret, global_steps)
             # Save model
             if epoch % save_freq == 0:
@@ -385,6 +466,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--cpu', type=int, default=1)
     parser.add_argument('--steps', type=int, default=2000)
+    parser.add_argument('--batch-size', type=int, default=500)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--exp_name', type=str, default='ppo')
     parser.add_argument('--model-path', type=str, default=None)
