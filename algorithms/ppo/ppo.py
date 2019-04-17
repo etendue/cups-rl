@@ -424,22 +424,22 @@ def ppo(env_fn,
             mask = 0. if d else 1.
             cum_ret += r
 
-            if d: # calculate the returns and GAE and reset environment
-                buf.finish_path(0.)
-                ep_ret.append(cum_ret)
-                o, d, r, cum_ret= env.reset() / 255., False, 0, 0.
-                h_t = torch.zeros(memory_size).cuda()
-                o = o.reshape(*obs_dim)
-                mask = 0. if d else 1.
-
-            # environment does not end
-            if not d and t == local_steps_per_epoch-1:
-                with torch.no_grad():
-                    o_t = Tensor(o).cuda()
-                    mask_t = Tensor([mask]).cuda()
-                    x, _ = ac_model.process_feature(o_t, mask_t, h_t)
-                    last_val = ac_model.value_function(x)
-                buf.finish_path(last_val)
+            if d or t == local_steps_per_epoch-1: # calculate the returns and GAE and reset environment
+                if d:
+                    buf.finish_path(0.)
+                    ep_ret.append(cum_ret)
+                    o, d, r, cum_ret= env.reset() / 255., False, 0, 0.
+                    h_t = torch.zeros(memory_size).cuda()
+                    o = o.reshape(*obs_dim)
+                    mask = 0. if d else 1.
+                else:
+                    # environment does not end
+                    with torch.no_grad():
+                        o_t = Tensor(o).cuda()
+                        mask_t = Tensor([mask]).cuda()
+                        x, _ = ac_model.process_feature(o_t, mask_t, h_t)
+                        last_val = ac_model.value_function(x)
+                    buf.finish_path(last_val)
 
         global_steps = (epoch + 1) * steps_per_epoch
         explore_stop = time.time()
