@@ -4,16 +4,27 @@ import torch.nn.functional as F
 from torch import Tensor
 import time
 import scipy.signal
-from algorithms.ppo.core import ActorCritic, count_vars,average_gradients, \
-    sync_all_params,mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs,mpi_sum
+from algorithms.ppo.core import ActorCritic, count_vars
+
 from  gym_ai2thor.envs.ai2thor_env import AI2ThorEnv
 from tensorboardX import SummaryWriter
 from collections import deque
 
+from  torch.nn.parallel import DistributedDataParallel
+import torch.distributed as dist
+
 
 def log_info(msg):
-    if proc_id() == 0:
+    if rank == 0:
         print(msg)
+
+
+def distributed_avg(x):
+    if world_size >1:
+        dist.all_reduce(x,dist.reduce_op.SUM)
+        return x/world_size
+    else:
+        return x
 
 
 class PPOBuffer:
@@ -23,17 +34,17 @@ class PPOBuffer:
     for calculating the advantages of state-action pairs.
     """
 
-    def __init__(self, obs_dim, act_dim, size, memory_size, gamma=0.99, lam=0.95):
-        self.obs_buf = np.zeros(
-            self._combined_shape(size, obs_dim), dtype=np.float32)
-        self.act_buf = np.zeros(size, dtype=np.float32)
-        self.adv_buf = np.zeros(size, dtype=np.float32)
-        self.rew_buf = np.zeros(size, dtype=np.float32)
-        self.ret_buf = np.zeros(size, dtype=np.float32)
-        self.val_buf = np.zeros(size, dtype=np.float32)
-        self.logp_buf = np.zeros(size, dtype=np.float32)
-        self.h_buf =np.zeros((size, memory_size), dtype=np.float32)
-        self.mask_buf = np.zeros(size, dtype=np.float32)
+    def __init__(self, obs_dim, size, memory_size, gamma=0.99, lam=0.95):
+        self.obs_buf = torch.zeros(self._combined_shape(size,obs_dim),dtype=torch.float32).cuda()
+        self.act_buf = torch.zeros(size,dtype=torch.float32).cuda()
+        self.adv_buf = torch.zeros(size,dtype=torch.float32).cuda()
+        self.rew_buf = torch.zeros(size,dtype=torch.float32).cuda()
+        self.ret_buf = torch.zeros(size,dtype=torch.float32).cuda()
+        self.val_buf = torch.zeros(size,dtype=torch.float32).cuda()
+        self.logp_buf = torch.zeros(size,dtype=torch.float32).cuda()
+        self.h_buf = torch.zeros((size, memory_size), dtype=torch.float32).cuda()
+        self.mask_buf = torch.zeros(size,dtype=torch.float32).cuda()
+
         self.gamma, self.lam = gamma, lam
         self.ptr, self.path_start_idx, self.max_size = 0, 0, size
 
@@ -68,13 +79,13 @@ class PPOBuffer:
         """
 
         path_slice = slice(self.path_start_idx, self.ptr)
-        rews = np.append(self.rew_buf[path_slice], last_val)
-        vals = np.append(self.val_buf[path_slice], last_val)
+        last_v = Tensor([last_val]).cuda()
+        rews = torch.cat([self.ret_buf[path_slice], last_v], dim=0)
+        vals = torch.cat([self.val_buf[path_slice], last_v], dim=0)
 
         # the next two lines implement GAE-Lambda advantage calculation
         deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
-        self.adv_buf[path_slice] = self._discount_cumsum(
-            deltas, self.gamma * self.lam)
+        self.adv_buf[path_slice] = self._discount_cumsum(deltas, self.gamma * self.lam)
 
         # the next line computes rewards-to-go, to be targets for the value function
         self.ret_buf[path_slice] = self._discount_cumsum(rews, self.gamma)[:-1]
@@ -90,7 +101,7 @@ class PPOBuffer:
         assert self.ptr == self.max_size  # buffer has to be full before you can get
         self.ptr, self.path_start_idx = 0, 0
         # the next two lines implement the advantage normalization trick
-        adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
+        adv_mean, adv_std = self._mean_std(self.adv_buf)
         self.adv_buf = (self.adv_buf - adv_mean) / adv_std
         return [
             self.obs_buf, self.act_buf, self.adv_buf, self.ret_buf,
@@ -107,11 +118,8 @@ class PPOBuffer:
             assert self.ptr == self.max_size  # buffer has to be full before you can get
             self.ptr, self.path_start_idx = 0, 0
             # the next two lines implement the advantage normalization trick
-            adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
+            adv_mean, adv_std = self._mean_std(self.adv_buf)
             self.adv_buf = (self.adv_buf - adv_mean) / adv_std
-
-        #assert self.max_size%batch_size == 0 # better to utilize all the experience
-        #assert batch_size%time_horizon == 0
 
         num_batch = self.max_size//batch_size
         num_block = self.max_size//time_horizon
@@ -132,21 +140,26 @@ class PPOBuffer:
     def _discount_cumsum(self, x, discount):
         """
         magic from rllab for computing discounted cumulative sums of vectors.
-
         input:
-            vector x,
-            [x0,
-            x1,
-            x2]
+            vector x,[x0,x1,x2]
 
         output:
-            [x0 + discount * x1 + discount^2 * x2,
-            x1 + discount * x2,
-            x2]
+            [x0 + discount * x1 + discount^2 * x2, x1 + discount * x2, x2]
         """
-        return scipy.signal.lfilter([1], [1, float(-discount)],
-                                    x[::-1],
-                                    axis=0)[::-1]
+        flipped_x = torch.flip(x,dims=(0,))
+        out=  scipy.signal.lfilter([1], [1, float(-discount)], flipped_x, axis=0)
+        t= torch.from_numpy(out).cuda()
+        return torch.flip(t,dims=(0,))
+
+    def _mean_std(self, x):
+        mean = torch.mean(x,dim=-1)
+        mean = distributed_avg(mean)
+
+        var = torch.mean((x-mean)**2)
+        var = distributed_avg(var)
+
+        return mean, torch.sqrt(var)
+
 
 
 """
@@ -159,7 +172,7 @@ with early stopping based on approximate KL
 
 
 def ppo(env_fn,
-        actor_critic=ActorCritic,
+        model=ActorCritic,
         ac_kwargs=dict(),
         seed=0,
         steps_per_epoch=4000,
@@ -180,7 +193,7 @@ def ppo(env_fn,
         env_fn : A function which creates a copy of the environment.
             The environment must satisfy the OpenAI Gym API.
 
-        actor_critic: The agent's main model which is composed of
+        ac_model: The agent's main model which is composed of
             the policy and value function model, where the policy takes
             some state, ``x`` and action ``a``, and value function takes
             the state ``x``. The model returns a tuple of:
@@ -250,48 +263,44 @@ def ppo(env_fn,
     horizon_t = 20
     batch_size = args.batch_size
 
-    seed += 10000 * proc_id()
+    seed += 10000 * rank
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     env = env_fn()
     obs_dim = env.observation_space.shape
-    act_dim = 1
 
     # Share information about action space with policy architecture
     ac_kwargs['action_space'] = env.action_space
 
     # Main model
-    actor_critic = actor_critic(in_features=obs_dim, **ac_kwargs)
+    print("Initialize Model...")
+    # Construct Model
 
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-    else:
-        device = torch.device('cpu')
+    ac_model = model(in_features=obs_dim, **ac_kwargs).cuda()
+    # Make model DistributedDataParallel
+    if world_size >1:
+        ac_model = DistributedDataParallel(ac_model, device_ids=[args.local_rank], output_device=args.local_rank)
 
-    if model_path:
-        actor_critic.load_state_dict(torch.load(model_path),map_location=device)
-
-    actor_critic.to(device)
+    #if model_path:
+    #    actor_critic.load_state_dict(torch.load(model_path),map_location=device)
 
     # Experience buffer
-    local_steps_per_epoch = int(steps_per_epoch / num_procs())
-    buf = PPOBuffer(obs_dim, act_dim, local_steps_per_epoch, memory_size, gamma, lam)
+    local_steps_per_epoch = int(steps_per_epoch / world_size)
+    buf = PPOBuffer(obs_dim, local_steps_per_epoch, memory_size, gamma, lam)
 
     # Count variables
     var_counts = tuple(
         count_vars(module)
-        for module in [actor_critic.policy, actor_critic.value_function, actor_critic.feature_base])
+        for module in [ac_model.policy, ac_model.value_function, ac_model.feature_base])
     log_info('\nNumber of parameters: \t pi: %d, \t v: %d \tbase: %d\n' % var_counts)
 
     # Optimizers
-    optimizer = torch.optim.Adam(actor_critic.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(ac_model.parameters(), lr=lr)
 
-    # Sync params across processes
-    sync_all_params(actor_critic.parameters(),device=device)
 
     # add TensorBoard
-    if proc_id() == 0:
+    if rank == 0:
         writer = SummaryWriter(comment="ai2thor_pp")
 
     def update_with_batch():
@@ -304,15 +313,14 @@ def ppo(env_fn,
             pi_loss_batches=[]
             v_loss_batches=[]
             for batch in batch_gen:
-                obs, act, adv, ret, logp_old, h, mask = [Tensor(x).to(device) for x in batch]
+                obs, act, adv, ret, logp_old, h, mask = batch
                 # Output from policy function graph
-                x, _ = actor_critic.process_feature(obs, mask, h, horizon_t)
-                _, logp_a, ent = actor_critic.policy(x, act)
-                v = actor_critic.value_function(x)
+                x, _ = ac_model.process_feature(obs, mask, h, horizon_t)
+                _, logp_a, ent = ac_model.policy(x, act)
+                v = ac_model.value_function(x)
                 # PPO policy objective
                 ratio = (logp_a - logp_old).exp()
-                min_adv = torch.where(adv > 0, (1 + clip_ratio) * adv,
-                                  (1 - clip_ratio) * adv)
+                min_adv = torch.where(adv > 0, (1 + clip_ratio) * adv, (1 - clip_ratio) * adv)
                 pi_loss = -(torch.min(ratio * adv, min_adv)).mean()
                 # PPO value objective
                 v_loss = F.mse_loss(v, ret)
@@ -322,7 +330,6 @@ def ppo(env_fn,
                 # Policy gradient step
                 optimizer.zero_grad()
                 (pi_loss + v_loss * alpha - entropy * beta).backward()
-                average_gradients(optimizer.param_groups)
                 optimizer.step()
 
                 # KL divergence
@@ -333,30 +340,33 @@ def ppo(env_fn,
                 pi_loss_batches.append(pi_loss.data.item())
                 v_loss_batches.append(v_loss.data.item())
 
-            kl = mpi_avg(np.mean(kl_batches))
+            kl_mean = torch.mean(torch.stack(kl_batches,dim=0))
+            kl = distributed_avg(kl_mean)
             if kl > 1.5 * target_kl:
-                log_info(f'Early stopping at step ({i}) due to reaching max kl. ({kl:.4})')
+                log_info(f'Early stopping at step ({i}) due to reaching max kl. ({kl.data.item():.4})')
                 break
-
-        ent_avg = mpi_avg(np.mean(ent_batches))
-        pi_loss_avg = mpi_avg(np.mean(pi_loss_batches))
-        v_loss_avg = mpi_avg(np.mean(v_loss_batches))
+        ent_avg = torch.mean(torch.stack(ent_batches))
+        pi_loss_avg = torch.mean(torch.stack(pi_loss_batches))
+        v_loss_avg = torch.mean(torch.stack(v_loss_batches))
+        ent_avg = distributed_avg(ent_avg)
+        pi_loss_avg = distributed_avg(pi_loss_avg)
+        v_loss_avg = distributed_avg(v_loss_avg)
         # Log info about epoch TODO
-        if proc_id() == 0:
+        if dist.get_rank() == 0:
             writer.add_scalar("KL", kl, global_steps)
             writer.add_scalar("Entropy", ent_avg, global_steps)
             writer.add_scalar("p_loss", pi_loss_avg, global_steps)
             writer.add_scalar("v_loss", v_loss_avg, global_steps)
 
     def update():
-        obs, act, adv, ret, logp_old, h, mask = [Tensor(x).to(device) for x in buf.get()]
+        obs, act, adv, ret, logp_old, h, mask = buf.get()
 
         # Training policy
         for i in range(train_iters):
             # Output from policy function graph
-            x,_ = actor_critic.process_feature(obs,mask,h,horizon_t)
-            _, logp_a, ent = actor_critic.policy(x,act)
-            v = actor_critic.value_function(x)
+            x,_ = ac_model.process_feature(obs, mask, h, horizon_t)
+            _, logp_a, ent = ac_model.policy(x, act)
+            v = ac_model.value_function(x)
             # PPO policy objective
             ratio = (logp_a - logp_old).exp()
             min_adv = torch.where(adv > 0, (1 + clip_ratio) * adv,
@@ -368,7 +378,7 @@ def ppo(env_fn,
             entropy = ent.mean()
             # KL divergence
             kl = (logp_old - logp_a).mean().detach()
-            kl = mpi_avg(kl.item())
+            kl = distributed_avg(kl)
             if kl > 1.5 * target_kl:
                 log_info(f'Early stopping at step ({i}) due to reaching max kl. ({kl:.4})')
                 break
@@ -376,43 +386,37 @@ def ppo(env_fn,
             # Policy gradient step
             optimizer.zero_grad()
             (pi_loss + v_loss * alpha - entropy*beta).backward()
-            average_gradients(optimizer.param_groups)
             optimizer.step()
 
-        # Log info about epoch TODO
-        if proc_id() == 0:
+        # Log info about epoch
+        if dist.get_rank() == 0:
             writer.add_scalar("KL",kl,global_steps)
             writer.add_scalar("Entropy", entropy, global_steps)
             writer.add_scalar("p_loss", pi_loss, global_steps)
             writer.add_scalar("v_loss", v_loss, global_steps)
 
-    start_time = time.time()
-
     o, d, r, cum_ret= env.reset() / 255., False, 0, 0.
     mask = 0. if d else 1.
-    h_t = torch.zeros(memory_size).to(device)
+    h_t = torch.zeros(memory_size).cuda()
     o = o.reshape(*obs_dim)
     ep_ret = deque(maxlen=5)
     ep_ret.append(0.)
+
+    explore_time=0
+    train_time=0
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
-        epoch_start = time.time()
-        actor_critic.eval()
+        explore_start = time.time()
+        ac_model.eval()
 
         for t in range(local_steps_per_epoch):
             with torch.no_grad():
-                o_t = Tensor(o).to(device)
-                mask_t = Tensor([mask]).to(device)
-                a_t, logp_t, _, v_t, h_t_next = actor_critic(o_t,mask_t,h_t)
+                o_t = Tensor(o).cuda()
+                mask_t = Tensor([mask]).cuda()
+                a_t, logp_t, _, v_t, h_t_next = ac_model(o_t, mask_t, h_t)
 
             # save experience
-            buf.store(o,
-                      a_t.data.item(),
-                      r,
-                      v_t.data.item(),
-                      logp_t.data.item(),
-                      h_t.cpu().data.numpy(),
-                      mask)
+            buf.store(o_t,a_t,r,v_t,logp_t,h_t,mask_t)
 
             h_t = h_t_next
             o, r, d, _ = env.step(a_t.data.item())
@@ -424,41 +428,51 @@ def ppo(env_fn,
                 buf.finish_path(0.)
                 ep_ret.append(cum_ret)
                 o, d, r, cum_ret= env.reset() / 255., False, 0, 0.
-                h_t = torch.zeros(memory_size).to(device)
+                h_t = torch.zeros(memory_size).cuda()
                 o = o.reshape(*obs_dim)
                 mask = 0. if d else 1.
 
-        # environment does not end
-        if not d:
-            with torch.no_grad():
-                o_t = Tensor(o).to(device)
-                mask_t = Tensor([mask]).to(device)
-                x, _ = actor_critic.process_feature(o_t,mask_t, h_t)
-                last_val = actor_critic.value_function(x).data.item()
-            buf.finish_path(last_val)
+            # environment does not end
+            if not d and t == local_steps_per_epoch-1:
+                with torch.no_grad():
+                    o_t = Tensor(o).cuda()
+                    mask_t = Tensor([mask]).cuda()
+                    x, _ = ac_model.process_feature(o_t, mask_t, h_t)
+                    last_val = ac_model.value_function(x)
+                buf.finish_path(last_val)
 
         global_steps = (epoch + 1) * steps_per_epoch
-        eval_stop = time.time()
+        explore_stop = time.time()
         # Perform PPO update!
-        actor_critic.train()
+        ac_model.train()
         if batch_size != -1:
             update_with_batch()
         else:
             update()
-        opti_stop = time.time()
+        optim_stop = time.time()
 
-        train_time = (opti_stop - eval_stop)/(opti_stop-epoch_start)
-        fps = global_steps//(opti_stop - start_time)
-        epoch_ret_sum, epoch_ret_count = mpi_sum([np.sum(ep_ret), len(ep_ret)])
-        avg_ret = epoch_ret_sum/epoch_ret_count
-        log_info(f"Episode({epoch}) FPS: ({fps}), training time ({int(train_time*100)})%, avg return({avg_ret})")
+        explore_time += explore_stop - explore_start
+        train_time += optim_stop - explore_stop
+        effective_fps = global_steps /(explore_time + train_time)
+        env_fps = global_steps/explore_time
 
-        if proc_id() == 0:
+        return_sum = distributed_avg(Tensor(np.sum(ep_ret)))
+        return_count = distributed_avg(Tensor(len(ep_ret)))
+
+        avg_ret = return_sum/return_count
+        log_info(f"Episode({epoch}) Effective FPS: ({effective_fps:.2}), Env FPS: ({env_fps:.2}), avg return({avg_ret})")
+
+        if dist.get_rank() == 0:
             writer.add_scalar("Return", avg_ret, global_steps)
             # Save model
             if epoch % save_freq == 0:
-                torch.save(actor_critic.state_dict(),"model_ppo.pt")
+                torch.save(ac_model.state_dict(), "model_ppo.pt")
 
+
+
+#add a global variable
+world_size = 1
+rank = 0
 
 if __name__ == '__main__':
     import argparse
@@ -467,19 +481,34 @@ if __name__ == '__main__':
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--cpu', type=int, default=2)
+    parser.add_argument('--world-size',type=int, default=1)
+    parser.add_argument('--rank',type=int,default=0)
+    parser.add_argument('--local_rank',type=int,default=0)
     parser.add_argument('--steps', type=int, default=2000)
     parser.add_argument('--batch-size', type=int, default=500)
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--exp_name', type=str, default='ppo')
     parser.add_argument('--model-path', type=str, default=None)
     args = parser.parse_args()
 
-    mpi_fork(args.cpu)  # run parallel code with mpi
+    torch.multiprocessing.set_start_method('spawn')
 
+    print("Collect Inputs...")
+    # Distributed backend type
+    dist_backend = 'nccl'
+    # Url used to setup distributed training
+    dist_url = "tcp://127.0.0.1:23456"
+
+    print("Initialize Process Group...")
+    # Initialize Process Group
+    world_size = args.world_size
+    rank = args.rank
+    if world_size > 1:
+        dist.init_process_group(backend=dist_backend, init_method=dist_url, rank=rank, world_size=world_size)
+    # Establish Local Rank and set device on this node, i.e. the GPU index
+    torch.cuda.set_device(args.local_rank)
 
     ppo(AI2ThorEnv,
-        actor_critic=ActorCritic,
+        model=ActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid] * args.l),
         gamma=args.gamma,
         seed=args.seed,
