@@ -21,7 +21,7 @@ def log_info(msg):
 
 def distributed_avg(x):
     if world_size >1:
-        dist.all_reduce(x,dist.reduce_op.SUM)
+        dist.all_reduce(x,dist.ReduceOp.SUM)
         return x/world_size
     else:
         return x
@@ -146,7 +146,7 @@ class PPOBuffer:
         output:
             [x0 + discount * x1 + discount^2 * x2, x1 + discount * x2, x2]
         """
-        flipped_x = torch.flip(x,dims=(0,))
+        flipped_x = torch.flip(x,dims=(0,)).cpu()
         out=  scipy.signal.lfilter([1], [1, float(-discount)], flipped_x, axis=0)
         t= torch.from_numpy(out).cuda()
         return torch.flip(t,dims=(0,))
@@ -278,10 +278,6 @@ def ppo(env_fn,
     # Construct Model
 
     ac_model = model(in_features=obs_dim, **ac_kwargs).cuda()
-    # Make model DistributedDataParallel
-    if world_size >1:
-        ac_model = DistributedDataParallel(ac_model, device_ids=[args.local_rank], output_device=args.local_rank)
-
     #if model_path:
     #    actor_critic.load_state_dict(torch.load(model_path),map_location=device)
 
@@ -294,6 +290,10 @@ def ppo(env_fn,
         count_vars(module)
         for module in [ac_model.policy, ac_model.value_function, ac_model.feature_base])
     log_info('\nNumber of parameters: \t pi: %d, \t v: %d \tbase: %d\n' % var_counts)
+    
+    # Make model DistributedDataParallel
+    if world_size >1:
+        ac_model = DistributedDataParallel(ac_model, device_ids=[args.local_rank], output_device=args.local_rank)
 
     # Optimizers
     optimizer = torch.optim.Adam(ac_model.parameters(), lr=lr)
@@ -315,9 +315,10 @@ def ppo(env_fn,
             for batch in batch_gen:
                 obs, act, adv, ret, logp_old, h, mask = batch
                 # Output from policy function graph
-                x, _ = ac_model.process_feature(obs, mask, h, horizon_t)
-                _, logp_a, ent = ac_model.policy(x, act)
-                v = ac_model.value_function(x)
+                # x, _ = ac_model.process_feature(obs, mask, h, horizon_t)
+                #_, logp_a, ent = ac_model.policy(x, act)
+                # v = ac_model.value_function(x)
+                _, logp_a,ent,v,_ = ac_model(obs,mask,h,a=act,horizon_t=horizon_t)
                 # PPO policy objective
                 ratio = (logp_a - logp_old).exp()
                 min_adv = torch.where(adv > 0, (1 + clip_ratio) * adv, (1 - clip_ratio) * adv)
@@ -335,10 +336,10 @@ def ppo(env_fn,
                 # KL divergence
                 kl = (logp_old - logp_a).mean().detach()
 
-                kl_batches.append(kl.data.item())
-                ent_batches.append(entropy.data.item())
-                pi_loss_batches.append(pi_loss.data.item())
-                v_loss_batches.append(v_loss.data.item())
+                kl_batches.append(kl)
+                ent_batches.append(entropy)
+                pi_loss_batches.append(pi_loss)
+                v_loss_batches.append(v_loss)
 
             kl_mean = torch.mean(torch.stack(kl_batches,dim=0))
             kl = distributed_avg(kl_mean)
@@ -352,7 +353,7 @@ def ppo(env_fn,
         pi_loss_avg = distributed_avg(pi_loss_avg)
         v_loss_avg = distributed_avg(v_loss_avg)
         # Log info about epoch TODO
-        if dist.get_rank() == 0:
+        if rank == 0:
             writer.add_scalar("KL", kl, global_steps)
             writer.add_scalar("Entropy", ent_avg, global_steps)
             writer.add_scalar("p_loss", pi_loss_avg, global_steps)
@@ -364,9 +365,10 @@ def ppo(env_fn,
         # Training policy
         for i in range(train_iters):
             # Output from policy function graph
-            x,_ = ac_model.process_feature(obs, mask, h, horizon_t)
-            _, logp_a, ent = ac_model.policy(x, act)
-            v = ac_model.value_function(x)
+            # x,_ = ac_model.process_feature(obs, mask, h, horizon_t)
+            # _, logp_a, ent = ac_model.policy(x, act)
+            # v = ac_model.value_function(x)
+            _, logp_a,ent,v,_ = ac_model(obs,mask,h,a=act,horizon_t=horizon_t)
             # PPO policy objective
             ratio = (logp_a - logp_old).exp()
             min_adv = torch.where(adv > 0, (1 + clip_ratio) * adv,
@@ -389,7 +391,7 @@ def ppo(env_fn,
             optimizer.step()
 
         # Log info about epoch
-        if dist.get_rank() == 0:
+        if rank == 0:
             writer.add_scalar("KL",kl,global_steps)
             writer.add_scalar("Entropy", entropy, global_steps)
             writer.add_scalar("p_loss", pi_loss, global_steps)
@@ -437,8 +439,9 @@ def ppo(env_fn,
                     with torch.no_grad():
                         o_t = Tensor(o).cuda()
                         mask_t = Tensor([mask]).cuda()
-                        x, _ = ac_model.process_feature(o_t, mask_t, h_t)
-                        last_val = ac_model.value_function(x)
+                        # x, _ = ac_model.process_feature(o_t, mask_t, h_t)
+                        # last_val = ac_model.value_function(x)
+                        _, _, _, last_val,_ = ac_model(ot,mask_t,h_t)
                     buf.finish_path(last_val)
 
         global_steps = (epoch + 1) * steps_per_epoch
@@ -455,14 +458,16 @@ def ppo(env_fn,
         train_time += optim_stop - explore_stop
         effective_fps = global_steps /(explore_time + train_time)
         env_fps = global_steps/explore_time
+        
+        return_sum = Tensor([sum(ep_ret)]).cuda()
+        return_count = Tensor([len(ep_ret)]).cuda()
+        return_sum = distributed_avg(return_sum)
+        return_count = distributed_avg(return_count)
 
-        return_sum = distributed_avg(Tensor(np.sum(ep_ret)))
-        return_count = distributed_avg(Tensor(len(ep_ret)))
+        avg_ret = return_sum.data.item()/return_count.data.item()	
+        log_info(f"Episode({epoch}) Effective FPS: ({effective_fps:.2f}), Env FPS: ({env_fps:.2f}), avg return({avg_ret})")
 
-        avg_ret = return_sum/return_count
-        log_info(f"Episode({epoch}) Effective FPS: ({effective_fps:.2}), Env FPS: ({env_fps:.2}), avg return({avg_ret})")
-
-        if dist.get_rank() == 0:
+        if rank == 0:
             writer.add_scalar("Return", avg_ret, global_steps)
             # Save model
             if epoch % save_freq == 0:
@@ -483,8 +488,8 @@ if __name__ == '__main__':
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--world-size',type=int, default=1)
     parser.add_argument('--rank',type=int,default=0)
-    parser.add_argument('--local_rank',type=int,default=0)
-    parser.add_argument('--steps', type=int, default=2000)
+    parser.add_argument('--local-rank',type=int,default=0)
+    parser.add_argument('--steps', type=int, default=1000)
     parser.add_argument('--batch-size', type=int, default=500)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--model-path', type=str, default=None)
