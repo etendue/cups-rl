@@ -372,7 +372,7 @@ if __name__ == '__main__':
         d_model = DistributedDataParallel(model, device_ids=[args.gpuid], output_device=args.gpuid)
     # start multiple processes
     sync_evs = [Event() for _ in range(args.num_envs)]
-    [ev.set() for ev in sync_evs]
+    [ev.clear() for ev in sync_evs]
     ret_queue = SimpleQueue()
 
     processes= []
@@ -384,9 +384,6 @@ if __name__ == '__main__':
         processes.append(p)
     # start trainer
     trainer(d_model,buf,sync_evs,ret_queue,args)
-    #p = Process(target=trainer, args=(model, buf, sync_evs, ret_queue, args))
-    #p.start()
-    #processes.append(p)
 
     for p in processes:
         p.join()
