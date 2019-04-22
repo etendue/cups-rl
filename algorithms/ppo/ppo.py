@@ -147,11 +147,12 @@ Proximal Policy Optimization (by clipping),
 with early stopping based on approximate KL
 
 """
-def worker(env_id, env_fn, model, exp_buf, epochs, sync_ev, ret_queue):
+def worker(env_id, gpuid, env_fn, model, exp_buf, epochs, sync_ev, ret_queue):
     print(f"Start worker with pid ({os.getpid()}) ...")
 
     steps_per_epoch = exp_buf.block_size
     rnn_state_size = exp_buf.h_buf.shape[1]
+    torch.cuda.set_device(gpuid)
 
     env = env_fn()
     o, d, r = env.reset() / 255., False, 0.
@@ -271,8 +272,8 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
             kl_mean = torch.mean(torch.stack(kl_batchs, dim=0))
             kl = distributed_avg(kl_mean)
             if kl > 1.5 * target_kl:
-                if args.rank == 0:
-                    print(f'Early stopping at iter ({i} /{args.train_iters}) due to reaching max kl. ({kl.data.item():.4})')
+               # if args.rank == 0:
+                print(f'Early stopping at iter ({i} /{args.train_iters}) due to reaching max kl. ({kl.data.item():.4})')
                 break
 
         # start workers for next epoch
@@ -294,10 +295,10 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
             writer.add_scalar("Entropy", ent_avg, global_steps)
             writer.add_scalar("p_loss", pi_loss_avg, global_steps)
             writer.add_scalar("v_loss", v_loss_avg, global_steps)
-            if len(rollout_ret) >0:
-                print(f"Epoch [{epoch}] return, max:({max(rollout_ret)}) min:({min(rollout_ret)}), avg:({np.mean(rollout_ret)})")
-            else:
-                print(f"Epoch [{epoch}] does not have finished rollouts")
+        if len(rollout_ret) >0:
+            print(f"Epoch [{epoch}] return, max:({max(rollout_ret)}) min:({min(rollout_ret)}), avg:({np.mean(rollout_ret)})")
+        else:
+            print(f"Epoch [{epoch}] does not have finished rollouts")
 
     print(f"Trainer with pid ({os.getpid()})  finished job")
 
@@ -342,6 +343,8 @@ if __name__ == '__main__':
         print("Initialize Process Group...")
         dist.init_process_group(backend=dist_backend, init_method=dist_url, rank=args.rank, world_size=args.world_size)
     # Establish Local Rank and set device on this node, i.e. the GPU index
+    
+    #os.environ['CUDA_VISIBLE_DEVICES']=str(args.gpuid)
     torch.cuda.set_device(args.gpuid)
     # get observation dimension
     env = AI2ThorEnv()
@@ -366,7 +369,7 @@ if __name__ == '__main__':
     buf.share_memory()
     # Make model DistributedDataParallel
     if args.world_size > 1:
-        model = DistributedDataParallel(model, device_ids=[args.gpuid], output_device=args.gpuid)
+        d_model = DistributedDataParallel(model, device_ids=[args.gpuid], output_device=args.gpuid)
     # start multiple processes
     sync_evs = [Event() for _ in range(args.num_envs)]
     [ev.set() for ev in sync_evs]
@@ -376,13 +379,14 @@ if __name__ == '__main__':
     #worker(0, AI2ThorEnv, model, buf, args.epochs, sync_evs[0], ret_queue)
     # start workers
     for env_id in range(args.num_envs):
-        p = Process(target=worker, args=(env_id, AI2ThorEnv, model, buf, args.epochs, sync_evs[env_id], ret_queue))
+        p = Process(target=worker, args=(env_id,args.gpuid, AI2ThorEnv, model, buf, args.epochs, sync_evs[env_id], ret_queue))
         p.start()
         processes.append(p)
     # start trainer
-    p = Process(target=trainer, args=(model, buf, sync_evs, ret_queue, args))
-    p.start()
-    processes.append(p)
+    trainer(d_model,buf,sync_evs,ret_queue,args)
+    #p = Process(target=trainer, args=(model, buf, sync_evs, ret_queue, args))
+    #p.start()
+    #processes.append(p)
 
     for p in processes:
         p.join()
