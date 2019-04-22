@@ -170,7 +170,7 @@ class ActorCritic(nn.Module):
         x, h = self.feature_base(x, mask, h, horizon_t)
         a, logp_a, ent = self.policy(x, a)
         v = self.value_function(x).squeeze(dim=-1)
-        return a, logp_a, ent, v, h
+        return a, logp_a, ent, v, h.squeeze()
 
     def process_feature(self, x, mask, h, horizon_t=1):
         self.rnn_out, self.rnn_out_last = self.feature_base(x, mask, h, horizon_t)

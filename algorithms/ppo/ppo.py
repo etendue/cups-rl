@@ -21,15 +21,15 @@ class PPOBuffer:
     """
 
     def __init__(self, obs_dim, size, num_envs, memory_size, gamma=0.99, lam=0.95):
-        self.obs_buf = torch.zeros((size, *obs_dim),dtype=torch.float32).cuda()
-        self.act_buf = torch.zeros(size,dtype=torch.float32).cuda()
-        self.adv_buf = torch.zeros(size,dtype=torch.float32).cuda()
-        self.rew_buf = torch.zeros(size,dtype=torch.float32).cuda()
-        self.ret_buf = torch.zeros(size,dtype=torch.float32).cuda()
-        self.val_buf = torch.zeros(size,dtype=torch.float32).cuda()
-        self.logp_buf = torch.zeros(size,dtype=torch.float32).cuda()
+        self.obs_buf = torch.zeros((size, *obs_dim), dtype=torch.float32).cuda()
+        self.act_buf = torch.zeros(size, dtype=torch.float32).cuda()
+        self.adv_buf = torch.zeros(size, dtype=torch.float32).cuda()
+        self.rew_buf = torch.zeros(size, dtype=torch.float32).cuda()
+        self.ret_buf = torch.zeros(size, dtype=torch.float32).cuda()
+        self.val_buf = torch.zeros(size, dtype=torch.float32).cuda()
+        self.logp_buf = torch.zeros(size, dtype=torch.float32).cuda()
         self.h_buf = torch.zeros((size, memory_size), dtype=torch.float32).cuda()
-        self.mask_buf = torch.zeros(size,dtype=torch.float32).cuda()
+        self.mask_buf = torch.zeros(size, dtype=torch.float32).cuda()
 
         # to control the indexing
         self.ptr = torch.zeros(num_envs,dtype=torch.int).cuda()
@@ -37,7 +37,6 @@ class PPOBuffer:
 
         # constants
         self.gamma, self.lam, self.max_size, self.block_size = gamma, lam, size, size//num_envs
-
 
     def share_memory(self):
         self.obs_buf.share_memory_()
@@ -56,15 +55,15 @@ class PPOBuffer:
         """
         Append one timestep of agent-environment interaction to the buffer.
         """
-        assert self.ptr[[envid]].item()  < self.block_size  # buffer has to have room so you can store
+        assert self.ptr[envid].item()  < self.block_size  # buffer has to have room so you can store
         ptr = self.ptr[envid].item()+ envid * self.block_size
-        self.obs_buf[ptr] = obs
-        self.act_buf[ptr] = act
-        self.rew_buf[ptr] = rew
-        self.val_buf[ptr] = val
-        self.logp_buf[ptr] = logp
-        self.h_buf[ptr] = h
-        self.mask_buf[ptr] = mask
+        self.obs_buf[ptr].copy_(obs)
+        self.act_buf[ptr].copy_(act)
+        self.rew_buf[ptr].copy_(rew)
+        self.val_buf[ptr].copy_(val)
+        self.logp_buf[ptr].copy_(logp)
+        self.h_buf[ptr].copy_(h)
+        self.mask_buf[ptr].copy_(mask)
         self.ptr[envid] += 1
 
     def finish_path(self, envid, last_val=0):
@@ -88,8 +87,8 @@ class PPOBuffer:
         path_slice = slice(path_start_idx, ptr)
 
         last_v = torch.Tensor([last_val]).cuda()
-        rews = torch.cat([self.ret_buf[path_slice], last_v], dim=0)
-        vals = torch.cat([self.val_buf[path_slice], last_v], dim=0)
+        rews = torch.cat((self.ret_buf[path_slice], last_v), dim=0)
+        vals = torch.cat((self.val_buf[path_slice], last_v), dim=0)
         # the next two lines implement GAE-Lambda advantage calculation
         deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
         self.adv_buf[path_slice] = self._discount_cumsum(deltas, self.gamma * self.lam)
@@ -118,8 +117,8 @@ class PPOBuffer:
         """
         if self.ptr.sum().item() != 0:
             assert self.ptr.sum().item() == self.max_size  # buffer has to be full before you can get
-            self.ptr = self.ptr *0
-            self.path_start_idx = self.path_start_idx *0
+            self.ptr.copy_(torch.zeros_like(self.ptr))
+            self.path_start_idx.copy_(torch.zeros_like(self.path_start_idx))
 
         num_batch = self.max_size//batch_size
         num_clusters = self.max_size // rnn_steps
@@ -155,10 +154,11 @@ def worker(env_id, env_fn, model, exp_buf, epochs, sync_ev, ret_queue):
     rnn_state_size = exp_buf.h_buf.shape[1]
 
     env = env_fn()
-    o, d, r = env.reset() / 255., False, 0
-    mask_t = torch.Tensor([1]).cuda()
+    o, d, r = env.reset() / 255., False, 0.
+    mask_t = torch.Tensor([1.]).cuda()
     o_t = torch.Tensor(o).cuda().unsqueeze(dim=0) # 128x128 -> 1x128x128
     h_t = torch.zeros(rnn_state_size).cuda()
+    r_t = torch.Tensor([r]).cuda()
     total_r = 0.
 
     for _ in range(epochs):
@@ -169,7 +169,7 @@ def worker(env_id, env_fn, model, exp_buf, epochs, sync_ev, ret_queue):
             for t in range(steps_per_epoch):
                 a_t, logp_t, _, v_t, h_t_next = model(o_t, mask_t, h_t)
                 # save experience
-                exp_buf.store(env_id, o_t, a_t, r, v_t, logp_t, h_t, mask_t)
+                exp_buf.store(env_id, o_t, a_t, r_t[0], v_t, logp_t, h_t, mask_t[0])
                 # interact with environment
                 o, r, d, _ = env.step(a_t.data.item())
                 o /= 255.
@@ -178,25 +178,29 @@ def worker(env_id, env_fn, model, exp_buf, epochs, sync_ev, ret_queue):
                 mask_t = torch.Tensor([(d+1)%2]).cuda()
                 o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
                 h_t = h_t_next
+                r_t = torch.Tensor([r]).cuda()
                 # check terminal state
                 if d or t == steps_per_epoch - 1:
                     if d: # calculate the returns and GAE and reset environment
                         exp_buf.finish_path(env_id, 0.)
-                        o, d, r = env.reset() / 255., False, 0
+                        o, d, r = env.reset() / 255., False, 0.
                         mask_t = torch.Tensor([1.]).cuda()
                         o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
                         h_t = torch.zeros(rnn_state_size).cuda()
+                        r_t = torch.Tensor([r]).cuda()
                         ret_queue.put(total_r)
                         total_r = 0.
                     else: # early cut due to reach maximum steps in on epoch
                         _, _, _, last_val, _ = model(o_t, mask_t, h_t)
                         exp_buf.finish_path(env_id,last_val)
                         ret_queue.put(-1)
-        sync_ev.set()  # Stop working
+        sync_ev.clear()  # Stop working
 
+    env.close()
     print(f"Worker with pid ({os.getpid()})  finished job")
 
 def trainer(model, exp_buf, sync_evs, ret_queue,args):
+    print(f"Trainer with pid ({os.getpid()})  starts job")
     if args.rank == 0:
         writer = SummaryWriter(comment="ai2thor_ppo")
 
@@ -211,7 +215,7 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
         return x
 
     # start workers for next epoch
-    [ev.reset() for ev in sync_evs]
+    [ev.set() for ev in sync_evs]
     # Training policy
     start_time = time.time()
     for epoch in range(args.epochs):
@@ -221,7 +225,7 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
         while finished_worker< args.num_envs :
             ret = ret_queue.get()
             finished_worker +=1
-            if ret != 0:
+            if ret != -1:
                 rollout_ret.append(ret)
 
         # normalize advantage
@@ -232,9 +236,9 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
             dist.all_reduce(var,dist.ReduceOp.SUM)
             mean /= args.world_size
             var /= args.world_size
-            exp_buf.normalize(mean_std=(mean, torch.sqrt(var)))
+            exp_buf.normalize_adv(mean_std=(mean, torch.sqrt(var)))
         else:
-            exp_buf.normalize()
+            exp_buf.normalize_adv()
 
         # train with batch
         for i in range(args.train_iters):
@@ -268,11 +272,11 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
             kl = distributed_avg(kl_mean)
             if kl > 1.5 * target_kl:
                 if args.rank == 0:
-                    print(f'Early stopping at inter ({i} /{args.train_iters}) due to reaching max kl. ({kl.data.item():.4})')
+                    print(f'Early stopping at iter ({i} /{args.train_iters}) due to reaching max kl. ({kl.data.item():.4})')
                 break
 
         # start workers for next epoch
-        [ev.reset() for ev in sync_evs]
+        [ev.set() for ev in sync_evs]
 
         # calculate statistics
         ent_avg = torch.mean(torch.stack(ent_batches))
@@ -284,7 +288,7 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
         # Log info about epoch
         if args.rank == 0:
             global_steps = (epoch + 1)* args.steps * args.world_size
-            fps = global_steps/(time.time()-start_time)
+            fps = global_steps*args.world_size/(time.time()-start_time)
             print(f"Epoch [{epoch}] avg. FPS:[{fps:.2f}]")
             writer.add_scalar("KL", kl, global_steps)
             writer.add_scalar("Entropy", ent_avg, global_steps)
@@ -305,20 +309,21 @@ if __name__ == '__main__':
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--rnn-size',tpye=int,default=256)
+    parser.add_argument('--rnn-size',type=int,default=256)
     parser.add_argument('--rnn-steps',type=int,default=25)
     parser.add_argument('--world-size',type=int, default=1)
     parser.add_argument('--rank',type=int,default=0)
     parser.add_argument('--gpuid',type=int,default=0)
-    parser.add_argument('--steps', type=int, default=1000)
-    parser.add_argument('--num-envs',type=int,default=1)
-    parser.add_argument('--batch-size', type=int, default=500)
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--steps', type=int, default=2000)
+    parser.add_argument('--num-envs',type=int,default=4)
+    parser.add_argument('--batch-size', type=int, default=250)
+    parser.add_argument('--epochs', type=int, default=10)
     #parser.add_argument('--model-path', type=str, default=None)
     parser.add_argument('--lr',type=float, default=3e-4)
-    parser.add_argument('--clip-ration',type=float,default=0.2)
+    parser.add_argument('--clip-ratio',type=float,default=0.2)
     parser.add_argument('--alpha',type=float,default=0.1)
     parser.add_argument('--beta', type=float, default=0.01)
+    parser.add_argument('--train-iters', type=int, default=40)
 
     args = parser.parse_args()
 
@@ -341,10 +346,10 @@ if __name__ == '__main__':
     # get observation dimension
     env = AI2ThorEnv()
     obs_dim = env.observation_space.shape
-    env.close()
     # Share information about action space with policy architecture
     ac_kwargs = dict(hidden_sizes=[args.hid] * args.l)
     ac_kwargs['action_space'] = env.action_space
+    env.close()
     # Main model
     print("Initialize Model...")
     # Construct Model
@@ -368,6 +373,7 @@ if __name__ == '__main__':
     ret_queue = SimpleQueue()
 
     processes= []
+    #worker(0, AI2ThorEnv, model, buf, args.epochs, sync_evs[0], ret_queue)
     # start workers
     for env_id in range(args.num_envs):
         p = Process(target=worker, args=(env_id, AI2ThorEnv, model, buf, args.epochs, sync_evs[env_id], ret_queue))
