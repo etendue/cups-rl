@@ -10,7 +10,7 @@ from tensorboardX import SummaryWriter
 
 from  torch.nn.parallel import DistributedDataParallel
 import torch.distributed as dist
-from  torch.multiprocessing import SimpleQueue, Event, Process
+from  torch.multiprocessing import SimpleQueue, Event, Process,Queue
 
 
 class PPOBuffer:
@@ -162,12 +162,15 @@ def worker(env_id, gpuid, env_fn, model, exp_buf, epochs, sync_ev, ret_queue):
     r_t = torch.Tensor([r]).cuda()
     total_r = 0.
 
-    for _ in range(epochs):
-        model.eval()
+    for epoch in range(epochs):
+        # model.eval()
         # Wait for trainer to inform next job
         sync_ev.wait()
+        #print("Worker", os.getpid(), "  get event at time ",time.time())
         with torch.no_grad():
             for t in range(steps_per_epoch):
+                #if epoch==1:
+                #  print(os.getpid()," step ",t)
                 a_t, logp_t, _, v_t, h_t_next = model(o_t, mask_t, h_t)
                 # save experience
                 exp_buf.store(env_id, o_t, a_t, r_t[0], v_t, logp_t, h_t, mask_t[0])
@@ -189,14 +192,21 @@ def worker(env_id, gpuid, env_fn, model, exp_buf, epochs, sync_ev, ret_queue):
                         o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
                         h_t = torch.zeros(rnn_state_size).cuda()
                         r_t = torch.Tensor([r]).cuda()
+                        #print(os.getpid(),"  Queue")
+                        #print(ret_queue)
+                        #print("is queue full:",ret_queue.full())
+                        #print("is queue empty:", ret_queue.empty())
                         ret_queue.put(total_r)
+                        print("Worker ",os.getpid()," sent  event")
                         total_r = 0.
                     else: # early cut due to reach maximum steps in on epoch
                         _, _, _, last_val, _ = model(o_t, mask_t, h_t)
                         exp_buf.finish_path(env_id,last_val)
                         ret_queue.put(-1)
+                        print("Worker ", os.getpid(), " sent event")
         sync_ev.clear()  # Stop working
 
+    sync_ev.wait() # wait to exits.
     env.close()
     print(f"Worker with pid ({os.getpid()})  finished job")
 
@@ -226,6 +236,7 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
         while finished_worker< args.num_envs :
             ret = ret_queue.get()
             finished_worker +=1
+            print("Trainer get event ", finished_worker)
             if ret != -1:
                 rollout_ret.append(ret)
 
@@ -242,6 +253,7 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
             exp_buf.normalize_adv()
 
         # train with batch
+        model.train()
         for i in range(args.train_iters):
             batch_gen = exp_buf.get_batch(args.batch_size, args.rnn_steps)
             kl_batchs, ent_batches, pi_loss_batches,v_loss_batches= [],[],[],[]
@@ -277,7 +289,9 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
                 break
 
         # start workers for next epoch
+        model.eval()
         [ev.set() for ev in sync_evs]
+        #print("Trainer set events at time ",time.time(), [e.is_set() for e in sync_evs]) 
 
         # calculate statistics
         ent_avg = torch.mean(torch.stack(ent_batches))
@@ -370,6 +384,8 @@ if __name__ == '__main__':
     # Make model DistributedDataParallel
     if args.world_size > 1:
         d_model = DistributedDataParallel(model, device_ids=[args.gpuid], output_device=args.gpuid)
+    else:
+        d_model = model
     # start multiple processes
     sync_evs = [Event() for _ in range(args.num_envs)]
     [ev.clear() for ev in sync_evs]
@@ -386,6 +402,7 @@ if __name__ == '__main__':
     trainer(d_model,buf,sync_evs,ret_queue,args)
 
     for p in processes:
+        print("process ",p.pid, " joined")
         p.join()
 
     print("Main process exits successfully")
