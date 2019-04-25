@@ -49,7 +49,7 @@ class CNNRNNBase(nn.Module):
     """
 
     def __init__(self, input_shape, output_size):
-        # TODO: initialization weights and bias
+        #  TODO: initialization weights and bias
         super(CNNRNNBase, self).__init__()
         ch, w, h = input_shape
         self.input_shape = input_shape

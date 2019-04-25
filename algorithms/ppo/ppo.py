@@ -193,7 +193,6 @@ def worker(env_id, gpuid, env_fn, model, exp_buf, epochs, sync_ev, ret_queue):
                         h_t = torch.zeros(rnn_state_size).cuda()
                         r_t = torch.Tensor([r]).cuda()
                         #print(os.getpid(),"  Queue")
-                        #print(ret_queue)
                         #print("is queue full:",ret_queue.full())
                         #print("is queue empty:", ret_queue.empty())
                         ret_queue.put(total_r)
