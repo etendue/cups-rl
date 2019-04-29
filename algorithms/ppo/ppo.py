@@ -8,9 +8,10 @@ from algorithms.ppo.core import ActorCritic, count_vars
 from  gym_ai2thor.envs.ai2thor_env import AI2ThorEnv
 from tensorboardX import SummaryWriter
 
-from  torch.nn.parallel import DistributedDataParallel
+from torch.nn.parallel import DistributedDataParallel
 import torch.distributed as dist
-from  torch.multiprocessing import SimpleQueue, Event, Process,Queue
+from torch.multiprocessing import SimpleQueue, Event, Process
+from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 
 
 class PPOBuffer:
@@ -130,6 +131,23 @@ class PPOBuffer:
                 self.logp_buf[sl], self.h_buf[sl], self.mask_buf[sl]
             ]
 
+    def batch_generator(self, batch_size):
+        """
+        Call this at the end of an epoch to get all of the data from
+        the buffer. Also, resets some pointers in the buffer.
+        """
+        if self.ptr.sum().item() != 0:
+            assert self.ptr.sum().item() == self.max_size  # buffer has to be full before you can get
+            self.ptr.copy_(torch.zeros_like(self.ptr))
+            self.path_start_idx.copy_(torch.zeros_like(self.path_start_idx))
+
+        batch_sampler = BatchSampler( SubsetRandomSampler(range(self.max_size)), batch_size, drop_last=False)
+        for idx in batch_sampler:
+            yield [
+                self.obs_buf[idx], self.act_buf[idx], self.adv_buf[idx], self.ret_buf[idx],
+                self.logp_buf[idx], self.h_buf[idx], self.mask_buf[idx]
+            ]
+
     def _discount_cumsum(self, x, discount):
         """
         magic from rllab for computing discounted cumulative sums of vectors.
@@ -137,9 +155,9 @@ class PPOBuffer:
         output: [x0 + discount * x1 + discount^2 * x2, x1 + discount * x2, x2]
         """
         flipped_x = torch.flip(x,dims=(0,)).cpu()
-        out=  scipy.signal.lfilter([1], [1, float(-discount)], flipped_x, axis=0)
-        t= torch.from_numpy(out).cuda()
-        return torch.flip(t,dims=(0,))
+        out = scipy.signal.lfilter([1], [1, float(-discount)], flipped_x, axis=0)
+        t = torch.from_numpy(out).cuda()
+        return torch.flip(t, dims=(0,))
 
 """
 Proximal Policy Optimization (by clipping),
@@ -147,14 +165,16 @@ Proximal Policy Optimization (by clipping),
 with early stopping based on approximate KL
 
 """
-def worker(env_id, gpuid, env_fn, model, exp_buf, epochs, sync_ev, ret_queue):
-    print(f"Start worker with pid ({os.getpid()}) ...")
+
+
+def actor(env_id, gpuid, model, exp_buf, epochs, sync_ev, ret_queue):
+    print(f"Start actor with pid ({os.getpid()}) ...")
 
     steps_per_epoch = exp_buf.block_size
     rnn_state_size = exp_buf.h_buf.shape[1]
     torch.cuda.set_device(gpuid)
 
-    env = env_fn()
+    env = AI2ThorEnv(config_file="config_files/OneMug.json")
     o, d, r = env.reset() / 255., False, 0.
     mask_t = torch.Tensor([1.]).cuda()
     o_t = torch.Tensor(o).cuda().unsqueeze(dim=0) # 128x128 -> 1x128x128
@@ -163,14 +183,10 @@ def worker(env_id, gpuid, env_fn, model, exp_buf, epochs, sync_ev, ret_queue):
     total_r = 0.
 
     for epoch in range(epochs):
-        # model.eval()
         # Wait for trainer to inform next job
         sync_ev.wait()
-        #print("Worker", os.getpid(), "  get event at time ",time.time())
         with torch.no_grad():
             for t in range(steps_per_epoch):
-                #if epoch==1:
-                #  print(os.getpid()," step ",t)
                 a_t, logp_t, _, v_t, h_t_next = model(o_t, mask_t, h_t)
                 # save experience
                 exp_buf.store(env_id, o_t, a_t, r_t[0], v_t, logp_t, h_t, mask_t[0])
@@ -192,32 +208,29 @@ def worker(env_id, gpuid, env_fn, model, exp_buf, epochs, sync_ev, ret_queue):
                         o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
                         h_t = torch.zeros(rnn_state_size).cuda()
                         r_t = torch.Tensor([r]).cuda()
-                        #print(os.getpid(),"  Queue")
-                        #print("is queue full:",ret_queue.full())
-                        #print("is queue empty:", ret_queue.empty())
                         ret_queue.put(total_r)
-                        print("Worker ",os.getpid()," sent  event")
                         total_r = 0.
                     else: # early cut due to reach maximum steps in on epoch
                         _, _, _, last_val, _ = model(o_t, mask_t, h_t)
                         exp_buf.finish_path(env_id,last_val)
-                        ret_queue.put(-1)
-                        print("Worker ", os.getpid(), " sent event")
+                        ret_queue.put(None)
         sync_ev.clear()  # Stop working
 
     sync_ev.wait() # wait to exits.
     env.close()
-    print(f"Worker with pid ({os.getpid()})  finished job")
+    print(f"actor with pid ({os.getpid()})  finished job")
 
-def trainer(model, exp_buf, sync_evs, ret_queue,args):
-    print(f"Trainer with pid ({os.getpid()})  starts job")
+
+def learner(model, exp_buf, sync_evs, ret_queue, args):
+    print(f"learner with pid ({os.getpid()})  starts job")
     if args.rank == 0:
         writer = SummaryWriter(comment="ai2thor_ppo")
 
     cr, alpha, beta, target_kl = args.clip_ratio,args.alpha,args.beta,0.01
     # Optimizers
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    #average across nodes and mulitple gpus
+    # average across nodes and multiple gpus
+
     def distributed_avg(x):
         if args.world_size >1:
             dist.all_reduce(x, dist.ReduceOp.SUM)
@@ -236,7 +249,7 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
             ret = ret_queue.get()
             finished_worker +=1
             print("Trainer get event ", finished_worker)
-            if ret != -1:
+            if ret:
                 rollout_ret.append(ret)
 
         # normalize advantage
@@ -254,7 +267,7 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
         # train with batch
         model.train()
         for i in range(args.train_iters):
-            batch_gen = exp_buf.get_batch(args.batch_size, args.rnn_steps)
+            batch_gen = exp_buf.batch_generator(args.batch_size)
             kl_batchs, ent_batches, pi_loss_batches,v_loss_batches= [],[],[],[]
 
             for batch in batch_gen:
@@ -283,14 +296,12 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
             kl_mean = torch.mean(torch.stack(kl_batchs, dim=0))
             kl = distributed_avg(kl_mean)
             if kl > 1.5 * target_kl:
-               # if args.rank == 0:
                 print(f'Early stopping at iter ({i} /{args.train_iters}) due to reaching max kl. ({kl.data.item():.4})')
                 break
 
         # start workers for next epoch
         model.eval()
         [ev.set() for ev in sync_evs]
-        #print("Trainer set events at time ",time.time(), [e.is_set() for e in sync_evs]) 
 
         # calculate statistics
         ent_avg = torch.mean(torch.stack(ent_batches))
@@ -309,11 +320,12 @@ def trainer(model, exp_buf, sync_evs, ret_queue,args):
             writer.add_scalar("p_loss", pi_loss_avg, global_steps)
             writer.add_scalar("v_loss", v_loss_avg, global_steps)
         if len(rollout_ret) >0:
-            print(f"Epoch [{epoch}] return, max:({max(rollout_ret)}) min:({min(rollout_ret)}), avg:({np.mean(rollout_ret)})")
+            print(f"Epoch [{epoch}] return, max:({max(rollout_ret)})"
+                  f" min:({min(rollout_ret)}), avg:({np.mean(rollout_ret)})")
         else:
             print(f"Epoch [{epoch}] does not have finished rollouts")
 
-    print(f"Trainer with pid ({os.getpid()})  finished job")
+    print(f"learner with pid ({os.getpid()})  finished job")
 
 
 if __name__ == '__main__':
@@ -323,26 +335,26 @@ if __name__ == '__main__':
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--rnn-size',type=int,default=256)
-    parser.add_argument('--rnn-steps',type=int,default=25)
+    parser.add_argument('--rnn-size',type=int,default=128)
+    parser.add_argument('--rnn-steps',type=int,default=1)
     parser.add_argument('--world-size',type=int, default=1)
     parser.add_argument('--rank',type=int,default=0)
     parser.add_argument('--gpuid',type=int,default=0)
-    parser.add_argument('--steps', type=int, default=2000)
+    parser.add_argument('--steps', type=int, default=1024)
     parser.add_argument('--num-envs',type=int,default=4)
-    parser.add_argument('--batch-size', type=int, default=250)
+    parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--epochs', type=int, default=10)
-    #parser.add_argument('--model-path', type=str, default=None)
+    # parser.add_argument('--model-path', type=str, default=None)
     parser.add_argument('--lr',type=float, default=3e-4)
     parser.add_argument('--clip-ratio',type=float,default=0.2)
     parser.add_argument('--alpha',type=float,default=0.1)
     parser.add_argument('--beta', type=float, default=0.01)
-    parser.add_argument('--train-iters', type=int, default=40)
+    parser.add_argument('--train-iters', type=int, default=1)
 
     args = parser.parse_args()
 
     seed = args.seed
-    seed += 10000 * args.rank + os.getpid()
+    seed += 10000 * args.rank
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -356,11 +368,10 @@ if __name__ == '__main__':
         print("Initialize Process Group...")
         dist.init_process_group(backend=dist_backend, init_method=dist_url, rank=args.rank, world_size=args.world_size)
     # Establish Local Rank and set device on this node, i.e. the GPU index
-    
-    #os.environ['CUDA_VISIBLE_DEVICES']=str(args.gpuid)
+
     torch.cuda.set_device(args.gpuid)
     # get observation dimension
-    env = AI2ThorEnv()
+    env = AI2ThorEnv(config_file="config_files/OneMug.json")
     obs_dim = env.observation_space.shape
     # Share information about action space with policy architecture
     ac_kwargs = dict(hidden_sizes=[args.hid] * args.l)
@@ -391,17 +402,15 @@ if __name__ == '__main__':
     ret_queue = SimpleQueue()
 
     processes= []
-    #worker(0, AI2ThorEnv, model, buf, args.epochs, sync_evs[0], ret_queue)
-    # start workers
     for env_id in range(args.num_envs):
-        p = Process(target=worker, args=(env_id,args.gpuid, AI2ThorEnv, model, buf, args.epochs, sync_evs[env_id], ret_queue))
+        p = Process(target=actor, args=(env_id, args.gpuid, model, buf, args.epochs, sync_evs[env_id], ret_queue))
         p.start()
         processes.append(p)
     # start trainer
-    trainer(d_model,buf,sync_evs,ret_queue,args)
+    learner(d_model, buf, sync_evs, ret_queue, args)
 
     for p in processes:
-        print("process ",p.pid, " joined")
+        print("process ", p.pid, " joined")
         p.join()
 
     print("Main process exits successfully")
