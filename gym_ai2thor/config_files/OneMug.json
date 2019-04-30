@@ -19,7 +19,7 @@
     "task": {
         "task_name": "PickUp",
         "target_object": "Mug",
-        "goal":1
+        "goal":{"Mug":1}
     },
     "max_episode_length":1024
 

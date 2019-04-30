@@ -142,7 +142,7 @@ class ActorCritic(nn.Module):
                  in_features,
                  action_space,
                  hidden_sizes=(64, 64),
-                 memory_size = 256,
+                 memory_size = 128,
                  activation=torch.tanh,
                  output_activation=None):
         super(ActorCritic, self).__init__()

@@ -88,7 +88,7 @@ class PPOBuffer:
         path_slice = slice(path_start_idx, ptr)
 
         last_v = torch.Tensor([last_val]).cuda()
-        rews = torch.cat((self.ret_buf[path_slice], last_v), dim=0)
+        rews = torch.cat((self.rew_buf[path_slice], last_v), dim=0)
         vals = torch.cat((self.val_buf[path_slice], last_v), dim=0)
         # the next two lines implement GAE-Lambda advantage calculation
         deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
@@ -97,7 +97,7 @@ class PPOBuffer:
         self.ret_buf[path_slice] = self._discount_cumsum(rews, self.gamma)[:-1]
         self.path_start_idx[envid] = self.ptr[envid]
 
-    def normalize_adv(self, mean_std=None):
+    def normalize_adv(self, mean_std=None, epsilon= 0.0001):
         """
         normalize the advantage with mean and standard deviation. If mean_std is not given, it calculate from date
         :param mean_std:
@@ -109,7 +109,7 @@ class PPOBuffer:
         else:
             mean= mean_std[0]
             std = mean_std[1]
-        self.adv_buf = (self.adv_buf - mean)/std
+        self.adv_buf = (self.adv_buf - mean)/(std +epsilon)
 
     def get_batch(self, batch_size, rnn_steps):
         """
@@ -181,8 +181,9 @@ def actor(env_id, gpuid, model, exp_buf, epochs, sync_ev, ret_queue):
     h_t = torch.zeros(rnn_state_size).cuda()
     r_t = torch.Tensor([r]).cuda()
     total_r = 0.
+    episode_steps = 0
 
-    for epoch in range(epochs):
+    for _ in range(epochs):
         # Wait for trainer to inform next job
         sync_ev.wait()
         with torch.no_grad():
@@ -194,26 +195,29 @@ def actor(env_id, gpuid, model, exp_buf, epochs, sync_ev, ret_queue):
                 o, r, d, _ = env.step(a_t.data.item())
                 o /= 255.
                 total_r += r  # accumulate reward within one rollout.
+                episode_steps +=1
                 # prepare inputs for next step
                 mask_t = torch.Tensor([(d+1)%2]).cuda()
                 o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
                 h_t = h_t_next
                 r_t = torch.Tensor([r]).cuda()
                 # check terminal state
-                if d or t == steps_per_epoch - 1:
-                    if d: # calculate the returns and GAE and reset environment
-                        exp_buf.finish_path(env_id, 0.)
-                        o, d, r = env.reset() / 255., False, 0.
-                        mask_t = torch.Tensor([1.]).cuda()
-                        o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
-                        h_t = torch.zeros(rnn_state_size).cuda()
-                        r_t = torch.Tensor([r]).cuda()
-                        ret_queue.put(total_r)
-                        total_r = 0.
-                    else: # early cut due to reach maximum steps in on epoch
-                        _, _, _, last_val, _ = model(o_t, mask_t, h_t)
-                        exp_buf.finish_path(env_id,last_val)
-                        ret_queue.put(None)
+                epoch_end = (t == (steps_per_epoch - 1))
+                if d: # calculate the returns and GAE and reset environment
+                    exp_buf.finish_path(env_id, 0.)
+                    o, d, r = env.reset() / 255., False, 0.
+                    mask_t = torch.Tensor([1.]).cuda()
+                    o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
+                    h_t = torch.zeros(rnn_state_size).cuda()
+                    r_t = torch.Tensor([r]).cuda()
+                    ret_queue.put((total_r, episode_steps, epoch_end))
+                    total_r = 0.
+                    episode_steps = 0
+                elif epoch_end: # early cut due to reach maximum steps in on epoch
+                    _, _, _, last_val, _ = model(o_t, mask_t, h_t)
+                    exp_buf.finish_path(env_id, last_val)
+                    ret_queue.put((None, None, epoch_end))
+
         sync_ev.clear()  # Stop working
 
     sync_ev.wait() # wait to exits.
@@ -232,8 +236,13 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
     # average across nodes and multiple gpus
 
     def distributed_avg(x):
-        if args.world_size >1:
-            dist.all_reduce(x, dist.ReduceOp.SUM)
+        if args.world_size > 1:
+            if not isinstance(x,torch.Tensor) or not x.is_cuda:
+                x_t = torch.Tensor(x).cuda()
+                dist.all_reduce(x_t,dist.ReduceOp.SUM)
+                x = x_t.item()
+            else:
+                dist.all_reduce(x, dist.ReduceOp.SUM)
             x /= dist.get_world_size()
         return x
 
@@ -244,13 +253,15 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
     for epoch in range(args.epochs):
         finished_worker = 0
         rollout_ret = []
+        rollout_steps = []
         # wait until all workers finish a epoch
-        while finished_worker< args.num_envs :
-            ret = ret_queue.get()
-            finished_worker +=1
-            print("Trainer get event ", finished_worker)
-            if ret:
+        while finished_worker < args.num_envs :
+            ret, steps, epoch_end = ret_queue.get()
+            if epoch_end:
+                finished_worker += 1
+            if ret is not None:
                 rollout_ret.append(ret)
+                rollout_steps.append(steps)
 
         # normalize advantage
         if args.world_size > 1:
@@ -268,7 +279,7 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
         model.train()
         for i in range(args.train_iters):
             batch_gen = exp_buf.batch_generator(args.batch_size)
-            kl_batchs, ent_batches, pi_loss_batches,v_loss_batches= [],[],[],[]
+            kl_sum, ent_sum, pi_loss_sum,v_loss_sum= .0, .0, .0, .0
 
             for batch in batch_gen:
                 obs, act, adv, ret, logp_old, h, mask = batch
@@ -285,18 +296,23 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
                 optimizer.zero_grad()
                 (pi_loss + v_loss * alpha - entropy * beta).backward()
                 optimizer.step()
-                # KL divergence
-                kl = (logp_old - logp_a).mean().detach()
+                with torch.no_grad():
+                    batch_size = len(batch)
+                    kl = (logp_old - logp_a).sum()
+                    if torch.isnan(kl):
+                        print("SOMETHING VERY WRONG HERE")
+                    kl_sum += kl.item()
+                    ent_sum += entropy.item() * batch_size
+                    pi_loss_sum += pi_loss.item() * batch_size
+                    v_loss_sum += v_loss.item() * batch_size
 
-                kl_batchs.append(kl)
-                ent_batches.append(entropy)
-                pi_loss_batches.append(pi_loss)
-                v_loss_batches.append(v_loss)
-
-            kl_mean = torch.mean(torch.stack(kl_batchs, dim=0))
-            kl = distributed_avg(kl_mean)
-            if kl > 1.5 * target_kl:
-                print(f'Early stopping at iter ({i} /{args.train_iters}) due to reaching max kl. ({kl.data.item():.4})')
+            kl_mean = kl_sum / exp_buf.max_size
+            kl_mean = distributed_avg(kl_mean)
+            print(f'Mean KL:{kl_mean:.4f}')
+            if kl_mean > 1.5 * target_kl:
+                #print(f'Early stopping at iter ({i} /{args.train_iters}) due to reaching max kl. ({kl_mean:.4f})')
+                #break
+                print(f'KL divergence exeeds target KL value {kl_mean:.4f} > 1.5 x {target_kl:.4f}')
                 break
 
         # start workers for next epoch
@@ -304,26 +320,26 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
         [ev.set() for ev in sync_evs]
 
         # calculate statistics
-        ent_avg = torch.mean(torch.stack(ent_batches))
-        pi_loss_avg = torch.mean(torch.stack(pi_loss_batches))
-        v_loss_avg = torch.mean(torch.stack(v_loss_batches))
+        ent_avg = ent_sum/exp_buf.max_size
+        pi_loss_avg = pi_loss_sum/exp_buf.max_size
+        v_loss_avg = v_loss_sum/exp_buf.max_size
         ent_avg = distributed_avg(ent_avg)
         pi_loss_avg = distributed_avg(pi_loss_avg)
         v_loss_avg = distributed_avg(v_loss_avg)
         # Log info about epoch
+        global_steps = (epoch + 1)* args.steps * args.world_size
         if args.rank == 0:
-            global_steps = (epoch + 1)* args.steps * args.world_size
             fps = global_steps*args.world_size/(time.time()-start_time)
             print(f"Epoch [{epoch}] avg. FPS:[{fps:.2f}]")
-            writer.add_scalar("KL", kl, global_steps)
+            writer.add_scalar("KL", kl_mean, global_steps)
             writer.add_scalar("Entropy", ent_avg, global_steps)
             writer.add_scalar("p_loss", pi_loss_avg, global_steps)
             writer.add_scalar("v_loss", v_loss_avg, global_steps)
         if len(rollout_ret) >0:
-            print(f"Epoch [{epoch}] return, max:({max(rollout_ret)})"
-                  f" min:({min(rollout_ret)}), avg:({np.mean(rollout_ret)})")
+            ret_by_1000 = np.sum(rollout_ret)*1000/exp_buf.max_size
+            print(f"Epoch [{epoch}] Steps {global_steps}: return:({ret_by_1000:.1f}), avg_steps:({np.mean(rollout_steps):.1f})")
         else:
-            print(f"Epoch [{epoch}] does not have finished rollouts")
+            print(f"Epoch [{epoch}] Steps {global_steps}: does not have finished rollouts")
 
     print(f"learner with pid ({os.getpid()})  finished job")
 
@@ -335,19 +351,19 @@ if __name__ == '__main__':
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--rnn-size',type=int,default=128)
-    parser.add_argument('--rnn-steps',type=int,default=1)
-    parser.add_argument('--world-size',type=int, default=1)
-    parser.add_argument('--rank',type=int,default=0)
-    parser.add_argument('--gpuid',type=int,default=0)
-    parser.add_argument('--steps', type=int, default=1024)
-    parser.add_argument('--num-envs',type=int,default=4)
+    parser.add_argument('--rnn-size', type=int, default=128)
+    parser.add_argument('--rnn-steps', type=int, default=1)
+    parser.add_argument('--world-size', type=int, default=1)
+    parser.add_argument('--rank', type=int, default=0)
+    parser.add_argument('--gpuid', type=int, default=0)
+    parser.add_argument('--steps', type=int, default=2048)
+    parser.add_argument('--num-envs', type=int, default=4)
     parser.add_argument('--batch-size', type=int, default=256)
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=100)
     # parser.add_argument('--model-path', type=str, default=None)
-    parser.add_argument('--lr',type=float, default=3e-4)
-    parser.add_argument('--clip-ratio',type=float,default=0.2)
-    parser.add_argument('--alpha',type=float,default=0.1)
+    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--clip-ratio', type=float, default=0.2)
+    parser.add_argument('--alpha', type=float, default=0.1)
     parser.add_argument('--beta', type=float, default=0.01)
     parser.add_argument('--train-iters', type=int, default=1)
 
@@ -376,6 +392,7 @@ if __name__ == '__main__':
     # Share information about action space with policy architecture
     ac_kwargs = dict(hidden_sizes=[args.hid] * args.l)
     ac_kwargs['action_space'] = env.action_space
+    ac_kwargs['memory_size'] = args.rnn_size
     env.close()
     # Main model
     print("Initialize Model...")
@@ -401,7 +418,7 @@ if __name__ == '__main__':
     [ev.clear() for ev in sync_evs]
     ret_queue = SimpleQueue()
 
-    processes= []
+    processes = []
     for env_id in range(args.num_envs):
         p = Process(target=actor, args=(env_id, args.gpuid, model, buf, args.epochs, sync_evs[env_id], ret_queue))
         p.start()
