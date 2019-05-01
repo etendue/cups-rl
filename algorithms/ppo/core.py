@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
+from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
+import scipy.signal
 
 
 def count_vars(module):
@@ -175,3 +177,129 @@ class ActorCritic(nn.Module):
     def process_feature(self, x, mask, h, horizon_t=1):
         self.rnn_out, self.rnn_out_last = self.feature_base(x, mask, h, horizon_t)
         return self.rnn_out, self.rnn_out_last
+
+
+class PPOBuffer:
+    """
+    A buffer for storing trajectories experienced by a PPO agent interacting
+    with the environment, and using Generalized Advantage Estimation (GAE-Lambda)
+    for calculating the advantages of state-action pairs.
+    """
+
+    def __init__(self, obs_dim, size, num_envs, memory_size, gamma=0.99, lam=0.95):
+        self.obs_buf = torch.zeros((size, *obs_dim), dtype=torch.float32).cuda()
+        self.act_buf = torch.zeros(size, dtype=torch.float32).cuda()
+        self.adv_buf = torch.zeros(size, dtype=torch.float32).cuda()
+        self.rew_buf = torch.zeros(size, dtype=torch.float32).cuda()
+        self.ret_buf = torch.zeros(size, dtype=torch.float32).cuda()
+        self.val_buf = torch.zeros(size, dtype=torch.float32).cuda()
+        self.logp_buf = torch.zeros(size, dtype=torch.float32).cuda()
+        self.h_buf = torch.zeros((size, memory_size), dtype=torch.float32).cuda()
+        self.mask_buf = torch.zeros(size, dtype=torch.float32).cuda()
+
+        # to control the indexing
+        self.ptr = torch.zeros(num_envs,dtype=torch.int).cuda()
+        self.path_start_idx = torch.zeros(num_envs,dtype=torch.int).cuda()
+
+        # constants
+        self.gamma, self.lam, self.max_size, self.block_size = gamma, lam, size, size//num_envs
+
+    def share_memory(self):
+        self.obs_buf.share_memory_()
+        self.act_buf.share_memory_()
+        self.adv_buf.share_memory_()
+        self.rew_buf.share_memory_()
+        self.ret_buf.share_memory_()
+        self.val_buf.share_memory_()
+        self.logp_buf.share_memory_()
+        self.h_buf.share_memory_()
+        self.mask_buf.share_memory_()
+        self.ptr.share_memory_()
+        self.path_start_idx.share_memory_()
+
+    def store(self, envid, obs, act, rew, val, logp, h, mask):
+        """
+        Append one timestep of agent-environment interaction to the buffer.
+        """
+        assert self.ptr[envid].item()  < self.block_size  # buffer has to have room so you can store
+        ptr = self.ptr[envid].item()+ envid * self.block_size
+        self.obs_buf[ptr].copy_(obs)
+        self.act_buf[ptr].copy_(act)
+        self.rew_buf[ptr].copy_(rew)
+        self.val_buf[ptr].copy_(val)
+        self.logp_buf[ptr].copy_(logp)
+        self.h_buf[ptr].copy_(h)
+        self.mask_buf[ptr].copy_(mask)
+        self.ptr[envid] += 1
+
+    def finish_path(self, envid, last_val=0):
+        """
+        Call this at the end of a trajectory, or when one gets cut off
+        by an epoch ending. This looks back in the buffer to where the
+        trajectory started, and uses rewards and value estimates from
+        the whole trajectory to compute advantage estimates with GAE-Lambda,
+        as well as compute the rewards-to-go for each state, to use as
+        the targets for the value function.
+
+        The "last_val" argument should be 0 if the trajectory ended
+        because the agent reached a terminal state (died), and otherwise
+        should be V(s_T), the value function estimated for the last state.
+        This allows us to bootstrap the reward-to-go calculation to account
+        for timesteps beyond the arbitrary episode horizon (or epoch cutoff).
+        """
+        # map the index from environment block to whole buffer
+        path_start_idx = self.path_start_idx[envid].item() + envid * self.block_size
+        ptr = self.ptr[envid].item() + envid * self.block_size
+        path_slice = slice(path_start_idx, ptr)
+
+        last_v = torch.Tensor([last_val]).cuda()
+        rews = torch.cat((self.rew_buf[path_slice], last_v), dim=0)
+        vals = torch.cat((self.val_buf[path_slice], last_v), dim=0)
+        # the next two lines implement GAE-Lambda advantage calculation
+        deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
+        self.adv_buf[path_slice] = self._discount_cumsum(deltas, self.gamma * self.lam)
+        # the next line computes rewards-to-go, to be targets for the value function
+        self.ret_buf[path_slice] = self._discount_cumsum(rews, self.gamma)[:-1]
+        self.path_start_idx[envid] = self.ptr[envid]
+
+    def normalize_adv(self, mean_std=None, epsilon= 0.0001):
+        """
+        normalize the advantage with mean and standard deviation. If mean_std is not given, it calculate from date
+        :param mean_std:
+        :return: None
+        """
+        if mean_std == None:
+            mean = self.adv_buf.mean()
+            std = self.adv_buf.std()
+        else:
+            mean= mean_std[0]
+            std = mean_std[1]
+        self.adv_buf = (self.adv_buf - mean)/(std +epsilon)
+
+    def batch_generator(self, batch_size):
+        """
+        Call this at the end of an epoch to get all of the data from
+        the buffer. Also, resets some pointers in the buffer.
+        """
+        if self.ptr.sum().item() != 0:
+            assert self.ptr.sum().item() == self.max_size  # buffer has to be full before you can get
+            self.ptr.copy_(torch.zeros_like(self.ptr))
+            self.path_start_idx.copy_(torch.zeros_like(self.path_start_idx))
+
+        batch_sampler = BatchSampler( SubsetRandomSampler(range(self.max_size)), batch_size, drop_last=False)
+        for idx in batch_sampler:
+            yield [
+                self.obs_buf[idx], self.act_buf[idx], self.adv_buf[idx], self.ret_buf[idx],
+                self.logp_buf[idx], self.h_buf[idx], self.mask_buf[idx]
+            ]
+
+    def _discount_cumsum(self, x, discount):
+        """
+        magic from rllab for computing discounted cumulative sums of vectors.
+        input: vector x,[x0,x1,x2]
+        output: [x0 + discount * x1 + discount^2 * x2, x1 + discount * x2, x2]
+        """
+        flipped_x = torch.flip(x,dims=(0,)).cpu()
+        out = scipy.signal.lfilter([1], [1, float(-discount)], flipped_x, axis=0)
+        t = torch.from_numpy(out).cuda()
+        return torch.flip(t, dims=(0,))
