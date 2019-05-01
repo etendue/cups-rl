@@ -167,11 +167,12 @@ with early stopping based on approximate KL
 """
 
 
-def actor(env_id, gpuid, model, exp_buf, epochs, sync_ev, ret_queue):
+def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue):
+
     print(f"Start actor with pid ({os.getpid()}) ...")
 
-    steps_per_epoch = exp_buf.block_size
-    rnn_state_size = exp_buf.h_buf.shape[1]
+    steps_per_epoch = buf.block_size
+    rnn_state_size = buf.h_buf.shape[1]
     torch.cuda.set_device(gpuid)
 
     env = AI2ThorEnv(config_file="config_files/OneMug.json")
@@ -190,7 +191,7 @@ def actor(env_id, gpuid, model, exp_buf, epochs, sync_ev, ret_queue):
             for t in range(steps_per_epoch):
                 a_t, logp_t, _, v_t, h_t_next = model(o_t, mask_t, h_t)
                 # save experience
-                exp_buf.store(env_id, o_t, a_t, r_t[0], v_t, logp_t, h_t, mask_t[0])
+                buf.store(env_id, o_t, a_t, r_t[0], v_t, logp_t, h_t, mask_t[0])
                 # interact with environment
                 o, r, d, _ = env.step(a_t.data.item())
                 o /= 255.
@@ -204,19 +205,19 @@ def actor(env_id, gpuid, model, exp_buf, epochs, sync_ev, ret_queue):
                 # check terminal state
                 epoch_end = (t == (steps_per_epoch - 1))
                 if d: # calculate the returns and GAE and reset environment
-                    exp_buf.finish_path(env_id, 0.)
+                    buf.finish_path(env_id, 0.)
                     o, d, r = env.reset() / 255., False, 0.
                     mask_t = torch.Tensor([1.]).cuda()
                     o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
                     h_t = torch.zeros(rnn_state_size).cuda()
                     r_t = torch.Tensor([r]).cuda()
-                    ret_queue.put((total_r, episode_steps, epoch_end))
+                    queue.put((total_r, episode_steps, epoch_end))
                     total_r = 0.
                     episode_steps = 0
                 elif epoch_end: # early cut due to reach maximum steps in on epoch
                     _, _, _, last_val, _ = model(o_t, mask_t, h_t)
-                    exp_buf.finish_path(env_id, last_val)
-                    ret_queue.put((None, None, epoch_end))
+                    buf.finish_path(env_id, last_val)
+                    queue.put((None, None, epoch_end))
 
         sync_ev.clear()  # Stop working
 
@@ -237,12 +238,7 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
 
     def distributed_avg(x):
         if args.world_size > 1:
-            if not isinstance(x,torch.Tensor) or not x.is_cuda:
-                x_t = torch.Tensor(x).cuda()
-                dist.all_reduce(x_t,dist.ReduceOp.SUM)
-                x = x_t.item()
-            else:
-                dist.all_reduce(x, dist.ReduceOp.SUM)
+            dist.all_reduce(x, dist.ReduceOp.SUM)
             x /= dist.get_world_size()
         return x
 
@@ -268,7 +264,7 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
             mean = exp_buf.adv_buf.mean()
             var = exp_buf.adv_buf.var()
             dist.all_reduce(mean, dist.ReduceOp.SUM)
-            dist.all_reduce(var,dist.ReduceOp.SUM)
+            dist.all_reduce(var, dist.ReduceOp.SUM)
             mean /= args.world_size
             var /= args.world_size
             exp_buf.normalize_adv(mean_std=(mean, torch.sqrt(var)))
@@ -279,7 +275,7 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
         model.train()
         for i in range(args.train_iters):
             batch_gen = exp_buf.batch_generator(args.batch_size)
-            kl_sum, ent_sum, pi_loss_sum,v_loss_sum= .0, .0, .0, .0
+            kl_sum, ent_sum, pi_loss_sum, v_loss_sum = [torch.tensor(0.0).cuda() for _ in range(4)]
 
             for batch in batch_gen:
                 obs, act, adv, ret, logp_old, h, mask = batch
@@ -291,43 +287,53 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
                 # PPO value objective
                 v_loss = F.mse_loss(v, ret)
                 # PPO entropy objective
-                entropy = ent.mean()
+                ent_mean = ent.mean()
                 # Policy gradient step
                 optimizer.zero_grad()
-                (pi_loss + v_loss * alpha - entropy * beta).backward()
+                (pi_loss + v_loss * alpha - ent_mean * beta).backward()
                 optimizer.step()
                 with torch.no_grad():
                     batch_size = len(batch)
-                    kl = (logp_old - logp_a).sum()
-                    if torch.isnan(kl):
-                        print("SOMETHING VERY WRONG HERE")
-                    kl_sum += kl.item()
-                    ent_sum += entropy.item() * batch_size
-                    pi_loss_sum += pi_loss.item() * batch_size
-                    v_loss_sum += v_loss.item() * batch_size
+                    kl_sum += (logp_old - logp_a).sum()
+                    ent_sum += ent_mean * batch_size
+                    pi_loss_sum += pi_loss * batch_size
+                    v_loss_sum += v_loss * batch_size
 
-            kl_mean = kl_sum / exp_buf.max_size
-            kl_mean = distributed_avg(kl_mean)
-            print(f'Mean KL:{kl_mean:.4f}')
-            if kl_mean > 1.5 * target_kl:
+            # kl_mean = kl_sum / exp_buf.max_size
+            # kl_mean = distributed_avg(kl_mean)
+            # if kl_mean > 1.5 * target_kl:
                 #print(f'Early stopping at iter ({i} /{args.train_iters}) due to reaching max kl. ({kl_mean:.4f})')
                 #break
-                print(f'KL divergence exeeds target KL value {kl_mean:.4f} > 1.5 x {target_kl:.4f}')
-                break
 
         # start workers for next epoch
         model.eval()
         [ev.set() for ev in sync_evs]
 
         # calculate statistics
+        kl_mean = kl_sum / exp_buf.max_size
         ent_avg = ent_sum/exp_buf.max_size
         pi_loss_avg = pi_loss_sum/exp_buf.max_size
         v_loss_avg = v_loss_sum/exp_buf.max_size
+        kl_mean = distributed_avg(kl_mean)
         ent_avg = distributed_avg(ent_avg)
         pi_loss_avg = distributed_avg(pi_loss_avg)
         v_loss_avg = distributed_avg(v_loss_avg)
         # Log info about epoch
         global_steps = (epoch + 1)* args.steps * args.world_size
+        ret_by_1000 = None
+        avg_steps = None
+
+        if kl_mean > 1.5 * target_kl:
+            print(f'KL divergence exeeds target KL value {kl_mean:.4f} > 1.5 x {target_kl:.4f}')
+        else:
+            print(f'KL divergence :{kl_mean:.4f}')
+        if len(rollout_ret) > 0:
+            ret_by_1000 = np.sum(rollout_ret)*1000/exp_buf.max_size
+            avg_steps = np.mean(rollout_steps)
+            print(f"Epoch [{epoch}] Steps {global_steps}: return:({ret_by_1000:.1f}), avg_steps:({avg_steps:.1f})")
+        else:
+            print(f"Epoch [{epoch}] Steps {global_steps}: does not have finished rollouts")
+
         if args.rank == 0:
             fps = global_steps*args.world_size/(time.time()-start_time)
             print(f"Epoch [{epoch}] avg. FPS:[{fps:.2f}]")
@@ -335,11 +341,9 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
             writer.add_scalar("Entropy", ent_avg, global_steps)
             writer.add_scalar("p_loss", pi_loss_avg, global_steps)
             writer.add_scalar("v_loss", v_loss_avg, global_steps)
-        if len(rollout_ret) >0:
-            ret_by_1000 = np.sum(rollout_ret)*1000/exp_buf.max_size
-            print(f"Epoch [{epoch}] Steps {global_steps}: return:({ret_by_1000:.1f}), avg_steps:({np.mean(rollout_steps):.1f})")
-        else:
-            print(f"Epoch [{epoch}] Steps {global_steps}: does not have finished rollouts")
+            if ret_by_1000:
+                writer.add_scalar("Return",ret_by_1000,global_steps)
+                writer.add_scalar("EpisodeSteps",avg_steps,global_steps)
 
     print(f"learner with pid ({os.getpid()})  finished job")
 
@@ -397,22 +401,22 @@ if __name__ == '__main__':
     # Main model
     print("Initialize Model...")
     # Construct Model
-    model = ActorCritic(in_features=obs_dim, **ac_kwargs).cuda()
+    ac_model = ActorCritic(in_features=obs_dim, **ac_kwargs).cuda()
     # share model to multiple processes
-    model.share_memory()
+    ac_model.share_memory()
     # Count variables
     if args.rank == 0:
         var_counts = tuple( count_vars(module)
-                            for module in [model.policy, model.value_function, model.feature_base])
+                            for module in [ac_model.policy, ac_model.value_function, ac_model.feature_base])
         print('\nNumber of parameters: \t pi: %d, \t v: %d \tbase: %d\n' % var_counts)
     # Experience buffer
     buf = PPOBuffer(obs_dim, args.steps, args.num_envs, args.rnn_size, args.gamma)
     buf.share_memory()
     # Make model DistributedDataParallel
     if args.world_size > 1:
-        d_model = DistributedDataParallel(model, device_ids=[args.gpuid], output_device=args.gpuid)
+        d_model = DistributedDataParallel(ac_model, device_ids=[args.gpuid], output_device=args.gpuid)
     else:
-        d_model = model
+        d_model = ac_model
     # start multiple processes
     sync_evs = [Event() for _ in range(args.num_envs)]
     [ev.clear() for ev in sync_evs]
@@ -420,7 +424,7 @@ if __name__ == '__main__':
 
     processes = []
     for env_id in range(args.num_envs):
-        p = Process(target=actor, args=(env_id, args.gpuid, model, buf, args.epochs, sync_evs[env_id], ret_queue))
+        p = Process(target=actor, args=(env_id, args.gpuid, ac_model, buf, args.epochs, sync_evs[env_id], ret_queue))
         p.start()
         processes.append(p)
     # start trainer
