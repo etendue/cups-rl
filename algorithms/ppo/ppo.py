@@ -169,6 +169,14 @@ with early stopping based on approximate KL
 
 def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue):
 
+    def reset(env):
+        o, d, r = env.reset() / 255., False, 0.
+        mask_t = torch.Tensor([1.]).cuda()
+        o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
+        h_t = torch.zeros(rnn_state_size).cuda()
+        r_t = torch.Tensor([r]).cuda()
+        return o_t, r_t, h_t, mask_t
+
     print(f"Start actor with pid ({os.getpid()}) ...")
 
     steps_per_epoch = buf.block_size
@@ -176,14 +184,9 @@ def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue):
     torch.cuda.set_device(gpuid)
 
     env = AI2ThorEnv(config_file="config_files/OneMug.json")
-    o, d, r = env.reset() / 255., False, 0.
-    mask_t = torch.Tensor([1.]).cuda()
-    o_t = torch.Tensor(o).cuda().unsqueeze(dim=0) # 128x128 -> 1x128x128
-    h_t = torch.zeros(rnn_state_size).cuda()
-    r_t = torch.Tensor([r]).cuda()
+    o_t, r_t, h_t, mask_t = reset(env)
     total_r = 0.
     episode_steps = 0
-
     for _ in range(epochs):
         # Wait for trainer to inform next job
         sync_ev.wait()
@@ -196,7 +199,7 @@ def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue):
                 o, r, d, _ = env.step(a_t.data.item())
                 o /= 255.
                 total_r += r  # accumulate reward within one rollout.
-                episode_steps +=1
+                episode_steps += 1
                 # prepare inputs for next step
                 mask_t = torch.Tensor([(d+1)%2]).cuda()
                 o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
@@ -206,18 +209,18 @@ def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue):
                 epoch_end = (t == (steps_per_epoch - 1))
                 if d: # calculate the returns and GAE and reset environment
                     buf.finish_path(env_id, 0.)
-                    o, d, r = env.reset() / 255., False, 0.
-                    mask_t = torch.Tensor([1.]).cuda()
-                    o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
-                    h_t = torch.zeros(rnn_state_size).cuda()
-                    r_t = torch.Tensor([r]).cuda()
+                    o_t, r_t, h_t, mask_t = reset(env)
+                    msg = {"msg_type":"train", "reward":total_r, "steps":episode_steps, "epoch_end":epoch_end}
+                    queue.put(msg)
                     queue.put((total_r, episode_steps, epoch_end))
                     total_r = 0.
                     episode_steps = 0
+                    
                 elif epoch_end: # early cut due to reach maximum steps in on epoch
                     _, _, _, last_val, _ = model(o_t, mask_t, h_t)
                     buf.finish_path(env_id, last_val)
-                    queue.put((None, None, epoch_end))
+                    msg = {"msg_type":"train","reward":None, "steps":None, "epoch_end":epoch_end}
+                    queue.put(msg)
 
         sync_ev.clear()  # Stop working
 
@@ -250,14 +253,19 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
         finished_worker = 0
         rollout_ret = []
         rollout_steps = []
+        test_ret = []
         # wait until all workers finish a epoch
-        while finished_worker < args.num_envs :
-            ret, steps, epoch_end = ret_queue.get()
-            if epoch_end:
-                finished_worker += 1
-            if ret is not None:
-                rollout_ret.append(ret)
-                rollout_steps.append(steps)
+        while finished_worker < args.num_envs:
+            msg = ret_queue.get()
+            if msg["msg_type"] == "train":
+                if msg["reward"] and msg["steps"]:
+                    rollout_ret.append(msg["reward"])
+                    rollout_steps.append(msg["steps"])
+                if msg["epoch_end"]:
+                    finished_worker += 1
+
+            elif msg["msg_type"] == "test":
+                test_ret.append(msg["reward"])
 
         # normalize advantage
         if args.world_size > 1:
@@ -322,17 +330,23 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
         global_steps = (epoch + 1)* args.steps * args.world_size
         ret_by_1000 = None
         avg_steps = None
+        avg_test_rewards = None
 
         if kl_mean > 1.5 * target_kl:
             print(f'KL divergence exeeds target KL value {kl_mean:.4f} > 1.5 x {target_kl:.4f}')
         else:
             print(f'KL divergence :{kl_mean:.4f}')
+
         if len(rollout_ret) > 0:
             ret_by_1000 = np.sum(rollout_ret)*1000/exp_buf.max_size
             avg_steps = np.mean(rollout_steps)
             print(f"Epoch [{epoch}] Steps {global_steps}: return:({ret_by_1000:.1f}), avg_steps:({avg_steps:.1f})")
         else:
             print(f"Epoch [{epoch}] Steps {global_steps}: does not have finished rollouts")
+
+        if test_ret:
+            avg_test_rewards = np.mean(test_ret)
+            print(f"Epoch [{epoch}] Steps {global_steps}: Rewards1000:({avg_test_rewards:.1f})")
 
         if args.rank == 0:
             fps = global_steps*args.world_size/(time.time()-start_time)
@@ -342,8 +356,10 @@ def learner(model, exp_buf, sync_evs, ret_queue, args):
             writer.add_scalar("p_loss", pi_loss_avg, global_steps)
             writer.add_scalar("v_loss", v_loss_avg, global_steps)
             if ret_by_1000:
-                writer.add_scalar("Return",ret_by_1000,global_steps)
-                writer.add_scalar("EpisodeSteps",avg_steps,global_steps)
+                writer.add_scalar("Return1000", ret_by_1000, global_steps)
+                writer.add_scalar("EpisodeSteps", avg_steps, global_steps)
+            if avg_test_rewards:
+                writer.add_scalar("Rewards1000", avg_test_rewards, global_steps)
 
     print(f"learner with pid ({os.getpid()})  finished job")
 
