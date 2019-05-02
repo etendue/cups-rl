@@ -65,7 +65,7 @@ def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue, exit_flag):
                 # check terminal state
                 epoch_end = (t == (steps_per_epoch - 1))
                 if d: # calculate the returns and GAE and reset environment
-                    buf.finish_path(env_id, 0.)
+                    buf.finish_path(env_id, r)
                     o_t, r_t, h_t, mask_t, d = reset(env, rnn_state_size)
                     msg = {"msg_type":"train", "reward":total_r, "steps":episode_steps, "epoch_end":epoch_end}
                     queue.put(msg)
@@ -93,7 +93,6 @@ def tester(gpuid, model, rnn_size, sync_ev, queue, exit_flag):
         o_t, r_t, h_t, mask_t, d = reset(env, rnn_size)
 
         sync_ev.wait()
-        print(exit_flag.value)
         if exit_flag.value == 1 :
             env.close()
             break
@@ -136,18 +135,19 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
 
     # start workers for next epoch
     [ev.set() for ev in sync_evs]
-    sync_tester_ev.set()
-    test_cycle= 5
+    if args.testing:
+        sync_tester_ev.set()
+        test_cycle= 5
     # Training policy
     start_time = time.time()
     for epoch in range(args.epochs):
         rollout_ret = []
         rollout_steps = []
-        test_ret = []
         # wait until all workers finish a epoch
         finished_worker = args.num_envs
 
-        if epoch%test_cycle == 0:
+        if args.testing and epoch%test_cycle == 0:
+            test_ret = []
             finished_worker += 1
 
         while finished_worker > 0:
@@ -202,11 +202,11 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
                     pi_loss_sum += pi_loss * batch_size
                     v_loss_sum += v_loss * batch_size
 
-            # kl_mean = kl_sum / exp_buf.max_size
-            # kl_mean = distributed_avg(kl_mean)
-            # if kl_mean > 1.5 * target_kl:
-                #print(f'Early stopping at iter ({i} /{args.train_iters}) due to reaching max kl. ({kl_mean:.4f})')
-                #break
+            kl_mean = kl_sum / exp_buf.max_size
+            kl_mean = distributed_avg(kl_mean)
+            if torch.abs(kl_mean) > 1.5 * target_kl:
+                print(f'Early stopping at iter ({i} /{args.train_iters}) due to reaching max kl. ({kl_mean:.4f})')
+                break
 
         # start workers for next epoch
         model.eval()
@@ -214,18 +214,19 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
         # set the tester, actor processes to exit
         if epoch == args.epochs -1:
             exit_flag.value = 1
-            sync_tester_ev.set()
+            if args.testing:
+                sync_tester_ev.set()
 
-        if (epoch+1)%test_cycle == 0:
+        if args.testing and (epoch+1)%test_cycle == 0:
             sync_tester_ev.set()
         [ev.set() for ev in sync_evs]
 
         # calculate statistics
-        kl_mean = kl_sum / exp_buf.max_size
+        # kl_mean = kl_sum / exp_buf.max_size
         ent_avg = ent_sum/exp_buf.max_size
         pi_loss_avg = pi_loss_sum/exp_buf.max_size
         v_loss_avg = v_loss_sum/exp_buf.max_size
-        kl_mean = distributed_avg(kl_mean)
+        # kl_mean = distributed_avg(kl_mean)
         ent_avg = distributed_avg(ent_avg)
         pi_loss_avg = distributed_avg(pi_loss_avg)
         v_loss_avg = distributed_avg(v_loss_avg)
@@ -235,10 +236,7 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
         avg_steps = None
         avg_test_rewards = None
 
-        if kl_mean > 1.5 * target_kl:
-            print(f'KL divergence exeeds target KL value {kl_mean:.4f} > 1.5 x {target_kl:.4f}')
-        else:
-            print(f'KL divergence :{kl_mean:.4f}')
+        print(f'KL divergence :{kl_mean:.4f}')
 
         if len(rollout_ret) > 0:
             ret_by_1000 = np.sum(rollout_ret)*1000/exp_buf.max_size
@@ -250,7 +248,7 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
         else:
             print(f"Epoch [{epoch}] Steps {global_steps}: does not have finished rollouts")
 
-        if test_ret:
+        if args.testing and len(test_ret) > 0:
             avg_test_rewards = np.mean(test_ret)
             avg_test_rewards = distributed_avg(torch.Tensor([avg_test_rewards]).cuda())
             print(f"Epoch [{epoch}] Steps {global_steps}: Rewards1000:({avg_test_rewards.item():.1f})")
@@ -265,7 +263,7 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
             if ret_by_1000:
                 writer.add_scalar("Return1000", ret_by_1000, global_steps)
                 writer.add_scalar("EpisodeSteps", avg_steps, global_steps)
-            if avg_test_rewards:
+            if args.testing and avg_test_rewards:
                 writer.add_scalar("Rewards1000", avg_test_rewards, global_steps)
 
     print(f"learner with pid ({os.getpid()})  finished job")
@@ -290,9 +288,10 @@ if __name__ == '__main__':
     # parser.add_argument('--model-path', type=str, default=None)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--clip-ratio', type=float, default=0.2)
-    parser.add_argument('--alpha', type=float, default=0.1)
-    parser.add_argument('--beta', type=float, default=0.01)
-    parser.add_argument('--train-iters', type=int, default=1)
+    parser.add_argument('--alpha', type=float, default=0.01)
+    parser.add_argument('--beta', type=float, default=0.0001)
+    parser.add_argument('--train-iters', type=int, default=10)
+    parser.add_argument('--testing', action='store_true', default=False)
 
     args = parser.parse_args()
 
@@ -343,9 +342,6 @@ if __name__ == '__main__':
     # start multiple processes
     sync_actor_evs = [Event() for _ in range(args.num_envs)]
     [ev.clear() for ev in sync_actor_evs]
-    sync_tester_ev = Event()
-    sync_tester_ev.clear()
-
     exit_flag = Value('i',0)
     ret_queue = SimpleQueue()
 
@@ -358,9 +354,13 @@ if __name__ == '__main__':
         processes.append(p)
 
     #start tester
-    p = Process(target=tester,args=(args.gpuid, ac_model, args.rnn_size, sync_tester_ev, ret_queue, exit_flag))
-    p.start()
-    processes.append(p)
+    sync_tester_ev = None
+    if args.testing:
+        sync_tester_ev = Event()
+        sync_tester_ev.clear()
+        p = Process(target=tester,args=(args.gpuid, ac_model, args.rnn_size, sync_tester_ev, ret_queue, exit_flag))
+        p.start()
+        processes.append(p)
     # start trainer
     learner(d_model, buf,args, sync_actor_evs, sync_tester_ev, ret_queue, exit_flag)
 
