@@ -34,21 +34,18 @@ def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue, exit_flag):
     steps_per_epoch = buf.block_size
     rnn_state_size = buf.h_buf.shape[1]
     torch.cuda.set_device(gpuid)
-
     env = AI2ThorEnv(config_file="config_files/OneMug.json")
-    o_t, r_t, h_t, mask_t, d = reset(env, rnn_state_size)
-    total_r = 0.
-    episode_steps = 0
-
     while True:
-        # Wait for trainer to inform next job
+        o_t, r_t, h_t, mask_t, d = reset(env, rnn_state_size)
+        total_r = 0.
+        episode_steps = 0
+        # Wait for next job
         sync_ev.wait()
         if exit_flag.value == 1:
             env.close()
             break
-
-        with torch.no_grad():
-            for t in range(steps_per_epoch):
+        for t in range(steps_per_epoch):
+            with torch.no_grad():
                 a_t, logp_t, _, v_t, h_t_next = model(o_t, mask_t, h_t)
                 # save experience
                 buf.store(env_id, o_t, a_t, r_t[0], v_t, logp_t, h_t, mask_t[0])
@@ -66,17 +63,18 @@ def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue, exit_flag):
                 epoch_end = (t == (steps_per_epoch - 1))
                 if d: # calculate the returns and GAE and reset environment
                     buf.finish_path(env_id, r)
-                    o_t, r_t, h_t, mask_t, d = reset(env, rnn_state_size)
                     msg = {"msg_type":"train", "reward":total_r, "steps":episode_steps, "epoch_end":epoch_end}
                     queue.put(msg)
+                    o_t, r_t, h_t, mask_t, d = reset(env, rnn_state_size)
                     total_r = 0.
                     episode_steps = 0
                 elif epoch_end: # early cut due to reach maximum steps in on epoch
                     _, _, _, last_val, _ = model(o_t, mask_t, h_t)
                     buf.finish_path(env_id, last_val)
-                    msg = {"msg_type":"train","reward":None, "steps":None, "epoch_end":epoch_end}
+                    msg = {"msg_type":"train", "reward":None, "steps":episode_steps, "epoch_end":epoch_end}
                     queue.put(msg)
-        sync_ev.clear()  # Stop working
+
+        sync_ev.clear()  
 
     print(f"actor with pid ({os.getpid()})  finished job")
 
@@ -91,7 +89,6 @@ def tester(gpuid, model, rnn_size, sync_ev, queue, exit_flag):
         episode_steps = 0
         total_r = 0.
         o_t, r_t, h_t, mask_t, d = reset(env, rnn_size)
-
         sync_ev.wait()
         if exit_flag.value == 1 :
             env.close()
@@ -113,6 +110,7 @@ def tester(gpuid, model, rnn_size, sync_ev, queue, exit_flag):
         msg = {"msg_type": "test", "reward": total_r, "steps": episode_steps, "epoch_end": True}
         queue.put(msg)
         sync_ev.clear()  # Stop working
+        
 
     print(f"Tester with pid ({os.getpid()})  finished job")
 
@@ -127,11 +125,12 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     # average across nodes and multiple gpus
 
-    def distributed_avg(x):
+    def dist_sum(x):
         if args.world_size > 1:
             dist.all_reduce(x, dist.ReduceOp.SUM)
-            x /= dist.get_world_size()
         return x
+    def dist_mean(x):
+        return dist_sum(x)/args.world_size()
 
     # start workers for next epoch
     [ev.set() for ev in sync_evs]
@@ -166,10 +165,8 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
         if args.world_size > 1:
             mean = exp_buf.adv_buf.mean()
             var = exp_buf.adv_buf.var()
-            dist.all_reduce(mean, dist.ReduceOp.SUM)
-            dist.all_reduce(var, dist.ReduceOp.SUM)
-            mean /= args.world_size
-            var /= args.world_size
+            mean = dist_mean(mean)
+            var = dist_mean(var)
             exp_buf.normalize_adv(mean_std=(mean, torch.sqrt(var)))
         else:
             exp_buf.normalize_adv()
@@ -203,7 +200,7 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
                     v_loss_sum += v_loss * batch_size
 
             kl_mean = kl_sum / exp_buf.max_size
-            kl_mean = distributed_avg(kl_mean)
+            kl_mean = dist_mean(kl_mean)
             if torch.abs(kl_mean) > 1.5 * target_kl:
                 print(f'Early stopping at iter ({i} /{args.train_iters}) due to reaching max kl. ({kl_mean:.4f})')
                 break
@@ -227,30 +224,37 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
         pi_loss_avg = pi_loss_sum/exp_buf.max_size
         v_loss_avg = v_loss_sum/exp_buf.max_size
         # kl_mean = distributed_avg(kl_mean)
-        ent_avg = distributed_avg(ent_avg)
-        pi_loss_avg = distributed_avg(pi_loss_avg)
-        v_loss_avg = distributed_avg(v_loss_avg)
+        ent_avg = dist_mean(ent_avg)
+        pi_loss_avg = dist_mean(pi_loss_avg)
+        v_loss_avg = dist_mean(v_loss_avg)
         # Log info about epoch
         global_steps = (epoch + 1)* args.steps * args.world_size
-        ret_by_1000 = None
+        avg_ret_by_1000 = None
         avg_steps = None
         avg_test_rewards = None
 
         print(f'KL divergence :{kl_mean:.4f}')
 
-        if len(rollout_ret) > 0:
-            ret_by_1000 = np.sum(rollout_ret)*1000/exp_buf.max_size
-            avg_steps = np.mean(rollout_steps)
-            ret_by_1000 = distributed_avg(torch.Tensor([ret_by_1000]).cuda())
-            avg_steps  = distributed_avg(torch.Tensor([avg_steps]).cuda())
-            print(f"Epoch [{epoch}] Steps {global_steps}: "
-                  f"return:({ret_by_1000.item():.1f}), avg_steps:({avg_steps.item():.1f})")
-        else:
-            print(f"Epoch [{epoch}] Steps {global_steps}: does not have finished rollouts")
 
-        if args.testing and len(test_ret) > 0:
+        ret_sum = np.sum(rollout_ret)
+        steps_sum = np.mean(rollout_steps)
+        count = len(rollout_ret)
+        ret_sum = dist_sum(torch.Tensor([ret_sum]).cuda())
+        steps_sum = dist_sum(torch.Tensor([steps_sum]).cuda())
+        count = dist_sum(torch.Tensor([count]).cuda())
+
+        if count.item() > 0:
+            avg_ret_by_1000 = (ret_sum/steps_sum).item() * 1000
+            avg_steps = (steps_sum/count).item()
+            print(f"Epoch [{epoch}] Steps {global_steps}: "
+                  f"return:({avg_ret_by_1000:.1f}), avg_steps:({avg_steps:.1f})")
+        else:
+            print(f"Epoch [{epoch}] Steps {global_steps}: "
+                  f"No reward is collected, very bad")
+      
+        if args.testing:
             avg_test_rewards = np.mean(test_ret)
-            avg_test_rewards = distributed_avg(torch.Tensor([avg_test_rewards]).cuda())
+            avg_test_rewards = dist_mean(torch.Tensor([avg_test_rewards]).cuda())
             print(f"Epoch [{epoch}] Steps {global_steps}: Rewards1000:({avg_test_rewards.item():.1f})")
 
         if args.rank == 0:
@@ -260,11 +264,14 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
             writer.add_scalar("Entropy", ent_avg, global_steps)
             writer.add_scalar("p_loss", pi_loss_avg, global_steps)
             writer.add_scalar("v_loss", v_loss_avg, global_steps)
-            if ret_by_1000:
-                writer.add_scalar("Return1000", ret_by_1000, global_steps)
+            if avg_ret_by_1000:
+                writer.add_scalar("Return1000", avg_ret_by_1000, global_steps)
                 writer.add_scalar("EpisodeSteps", avg_steps, global_steps)
             if args.testing and avg_test_rewards:
                 writer.add_scalar("Rewards1000", avg_test_rewards, global_steps)
+        
+        if (epoch +1) % 50 == 0:
+            torch.save(model.state_dict(), "model.pt") 
 
     print(f"learner with pid ({os.getpid()})  finished job")
 
@@ -288,9 +295,9 @@ if __name__ == '__main__':
     # parser.add_argument('--model-path', type=str, default=None)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--clip-ratio', type=float, default=0.2)
-    parser.add_argument('--alpha', type=float, default=0.01)
-    parser.add_argument('--beta', type=float, default=0.0001)
-    parser.add_argument('--train-iters', type=int, default=10)
+    parser.add_argument('--alpha', type=float, default=0.001)
+    parser.add_argument('--beta', type=float, default=0.001)
+    parser.add_argument('--train-iters', type=int, default=4)
     parser.add_argument('--testing', action='store_true', default=False)
 
     args = parser.parse_args()
