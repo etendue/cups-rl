@@ -35,10 +35,10 @@ def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue, exit_flag):
     rnn_state_size = buf.h_buf.shape[1]
     torch.cuda.set_device(gpuid)
     env = AI2ThorEnv(config_file="config_files/OneMug.json")
+    o_t, r_t, h_t, mask_t, d = reset(env, rnn_state_size)
+    total_r = 0.
+    episode_steps = 0
     while True:
-        o_t, r_t, h_t, mask_t, d = reset(env, rnn_state_size)
-        total_r = 0.
-        episode_steps = 0
         # Wait for next job
         sync_ev.wait()
         if exit_flag.value == 1:
@@ -71,8 +71,12 @@ def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue, exit_flag):
                 elif epoch_end: # early cut due to reach maximum steps in on epoch
                     _, _, _, last_val, _ = model(o_t, mask_t, h_t)
                     buf.finish_path(env_id, last_val)
+                    total_r += last_val.item()
                     msg = {"msg_type":"train", "reward":None, "steps":episode_steps, "epoch_end":epoch_end}
                     queue.put(msg)
+                    #o_t, r_t, h_t, mask_t, d = reset(env, rnn_state_size)
+                    #total_r = 0.
+                    #episode_steps = 0
 
         sync_ev.clear()  
 
@@ -120,7 +124,7 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
     if args.rank == 0:
         writer = SummaryWriter(comment="ai2thor_ppo")
 
-    cr, alpha, beta, target_kl = args.clip_ratio,args.alpha,args.beta,0.01
+    cr, alpha, beta, target_kl = args.clip_ratio,args.alpha,args.beta,args.target_kl
     # Optimizers
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     # average across nodes and multiple gpus
@@ -129,8 +133,9 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
         if args.world_size > 1:
             dist.all_reduce(x, dist.ReduceOp.SUM)
         return x
+
     def dist_mean(x):
-        return dist_sum(x)/args.world_size()
+        return dist_sum(x)/args.world_size
 
     # start workers for next epoch
     [ev.set() for ev in sync_evs]
@@ -162,14 +167,14 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
                 finished_worker -= 1
 
         # normalize advantage
-        if args.world_size > 1:
-            mean = exp_buf.adv_buf.mean()
-            var = exp_buf.adv_buf.var()
-            mean = dist_mean(mean)
-            var = dist_mean(var)
-            exp_buf.normalize_adv(mean_std=(mean, torch.sqrt(var)))
-        else:
-            exp_buf.normalize_adv()
+        # if args.world_size > 1:
+        #     mean = exp_buf.adv_buf.mean()
+        #     var = exp_buf.adv_buf.var()
+        #     mean = dist_mean(mean)
+        #     var = dist_mean(var)
+        #     exp_buf.normalize_adv(mean_std=(mean, torch.sqrt(var)))
+        # else:
+        #     exp_buf.normalize_adv()
 
         # train with batch
         model.train()
@@ -233,11 +238,8 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
         avg_steps = None
         avg_test_rewards = None
 
-        print(f'KL divergence :{kl_mean:.4f}')
-
-
         ret_sum = np.sum(rollout_ret)
-        steps_sum = np.mean(rollout_steps)
+        steps_sum = np.sum(rollout_steps)
         count = len(rollout_ret)
         ret_sum = dist_sum(torch.Tensor([ret_sum]).cuda())
         steps_sum = dist_sum(torch.Tensor([steps_sum]).cuda())
@@ -269,9 +271,12 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
                 writer.add_scalar("EpisodeSteps", avg_steps, global_steps)
             if args.testing and avg_test_rewards:
                 writer.add_scalar("Rewards1000", avg_test_rewards, global_steps)
-        
-        if (epoch +1) % 50 == 0:
-            torch.save(model.state_dict(), "model.pt") 
+            
+            if (epoch +1) % 20 == 0:
+                if args.world_size > 0:
+                    torch.save(model.module.state_dict(), f'model{epoch}.pt') 
+                else:
+                    torch.save(model.state_dict(), f'model{epoch}.pt') 
 
     print(f"learner with pid ({os.getpid()})  finished job")
 
@@ -290,15 +295,16 @@ if __name__ == '__main__':
     parser.add_argument('--gpuid', type=int, default=0)
     parser.add_argument('--steps', type=int, default=2048)
     parser.add_argument('--num-envs', type=int, default=4)
-    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--epochs', type=int, default=100)
-    # parser.add_argument('--model-path', type=str, default=None)
+    parser.add_argument('--model-path', type=str, default=None)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--clip-ratio', type=float, default=0.2)
-    parser.add_argument('--alpha', type=float, default=0.001)
+    parser.add_argument('--alpha', type=float, default=0.1)
     parser.add_argument('--beta', type=float, default=0.001)
-    parser.add_argument('--train-iters', type=int, default=4)
+    parser.add_argument('--train-iters', type=int, default=10)
     parser.add_argument('--testing', action='store_true', default=False)
+    parser.add_argument('--target-kl', type=float, default=0.01)
 
     args = parser.parse_args()
 
@@ -309,8 +315,7 @@ if __name__ == '__main__':
 
     torch.multiprocessing.set_start_method('spawn')
     if args.world_size > 1:
-        # Initialize Process Group
-        # Distributed backend type
+        # Initialize Process Group, distributed backend type
         dist_backend = 'nccl'
         # Url used to setup distributed training
         dist_url = "tcp://127.0.0.1:23456"
@@ -331,6 +336,8 @@ if __name__ == '__main__':
     print("Initialize Model...")
     # Construct Model
     ac_model = ActorCritic(in_features=obs_dim, **ac_kwargs).cuda()
+    if args.model_path:
+        ac_model.load_state_dict(torch.load(args.model_path))
     # share model to multiple processes
     ac_model.share_memory()
     # Count variables
