@@ -21,11 +21,12 @@ with early stopping based on approximate KL
 
 def reset(env, rnn_size):
     o, d, r = env.reset() / 255., False, 0.
-    mask_t = torch.Tensor([1.]).cuda()
+    mask_t = torch.tensor(1.).cuda()
+    last_a = torch.tensor(0).cuda()
     o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
     h_t = torch.zeros(rnn_size).cuda()
-    r_t = torch.Tensor([r]).cuda()
-    return o_t, r_t, h_t, mask_t, d
+    r_t = torch.tensor(r).cuda()
+    return o_t, r_t, h_t, last_a, mask_t, d
 
 
 def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue, exit_flag):
@@ -46,26 +47,27 @@ def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue, exit_flag):
             break
         for t in range(steps_per_epoch):
             with torch.no_grad():
-                a_t, logp_t, _, v_t, h_t_next = model(o_t, mask_t, h_t)
+                a_t, logp_t, _, v_t, h_t_next = model(o_t, mask_t.unsqueeze(dim=0), h_t,last_a=last_a.unsqueeze(dim=0))
                 # save experience
-                buf.store(env_id, o_t, a_t, r_t[0], v_t, logp_t, h_t, mask_t[0])
+                buf.store(env_id, o_t, a_t, r_t, v_t, logp_t, h_t, mask_t)
                 # interact with environment
                 o, r, d, _ = env.step(a_t.data.item())
                 o /= 255.
                 total_r += r  # accumulate reward within one rollout.
                 episode_steps += 1
                 # prepare inputs for next step
-                mask_t = torch.Tensor([(d+1)%2]).cuda()
+                mask_t = torch.tensor((d+1)%2).cuda()
                 o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
                 h_t = h_t_next
-                r_t = torch.Tensor([r]).cuda()
+                r_t = torch.tensor(r).cuda()
+                last_a = a_t
                 # check terminal state
                 epoch_end = (t == (steps_per_epoch - 1))
                 if d: # calculate the returns and GAE and reset environment
                     buf.finish_path(env_id, r)
                     msg = {"msg_type":"train", "reward":total_r, "steps":episode_steps, "epoch_end":epoch_end}
                     queue.put(msg)
-                    o_t, r_t, h_t, mask_t, d = reset(env, rnn_state_size)
+                    o_t, r_t, h_t, last_a, mask_t, d= reset(env, rnn_state_size)
                     total_r = 0.
                     episode_steps = 0
                 elif epoch_end: # early cut due to reach maximum steps in on epoch
@@ -74,7 +76,7 @@ def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue, exit_flag):
                     total_r += last_val.item()
                     msg = {"msg_type":"train", "reward":None, "steps":episode_steps, "epoch_end":epoch_end}
                     queue.put(msg)
-                    #o_t, r_t, h_t, mask_t, d = reset(env, rnn_state_size)
+                    #o_t, r_t, h_t, last_a, mask_t, d = reset(env, rnn_state_size)
                     #total_r = 0.
                     #episode_steps = 0
 
@@ -100,15 +102,16 @@ def tester(gpuid, model, rnn_size, sync_ev, queue, exit_flag):
 
         while not d:
             with torch.no_grad():
-                a_t, logp_t, _, v_t, h_t_next = model(o_t, mask_t, h_t)
+                a_t, logp_t, _, v_t, h_t_next = model(o_t, mask_t.unsqueeze(dim=0), h_t,last_a=last_a.unsqueeze(dim=0))
                 # interact with environment
                 o, r, d, _ = env.step(a_t.data.item())
                 o /= 255.
                 total_r += r  # accumulate reward within one rollout.
                 # prepare inputs for next step
-                mask_t = torch.Tensor([(d + 1) % 2]).cuda()
+                mask_t = torch.tensor((d + 1) % 2).cuda()
                 o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
                 h_t = h_t_next
+                last_a = a_t
                 episode_steps +=1
 
         msg = {"msg_type": "test", "reward": total_r, "steps": episode_steps, "epoch_end": True}
@@ -183,8 +186,8 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev,ret_queue, exit_flag)
             kl_sum, ent_sum, pi_loss_sum, v_loss_sum = [torch.tensor(0.0).cuda() for _ in range(4)]
 
             for batch in batch_gen:
-                obs, act, adv, ret, logp_old, h, mask = batch
-                _, logp_a, ent, v, _ = model(obs, mask, h, a=act, horizon_t=args.rnn_steps)
+                obs, act, adv, ret, logp_old, h, mask, last_a = batch
+                _, logp_a, ent, v, _ = model(obs, mask, h, last_a=last_a, a=act, horizon_t=args.rnn_steps)
                 # PPO policy objective
                 ratio = (logp_a - logp_old).exp()
                 min_adv = torch.where(adv > 0, (1 + cr) * adv, (1 - cr) * adv)

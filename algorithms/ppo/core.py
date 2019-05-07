@@ -136,7 +136,8 @@ class CategoricalPolicy(nn.Module):
         if a is None:
             a = policy.sample().squeeze()
         logp_a = policy.log_prob(a).squeeze()
-        return a, logp_a, policy.entropy()
+        ent = policy.entropy().squeeze()
+        return a, logp_a, ent
 
 
 class ActorCritic(nn.Module):
@@ -153,26 +154,34 @@ class ActorCritic(nn.Module):
             input_shape=in_features,
             output_size=memory_size
         )
+        # add last action as input
+        self.action_n = action_space.n
+        self.base_out_size = action_space.n + memory_size
 
         self.policy = CategoricalPolicy(
-                memory_size,
+                self.base_out_size,
                 hidden_sizes,
                 activation,
                 output_activation,
                 action_dim=action_space.n)
 
         self.value_function = MLP(
-            layers=[memory_size] + list(hidden_sizes) + [1],
+            layers=[self.base_out_size] + list(hidden_sizes) + [1],
             activation=activation,
-            output_squeeze= True)
+            output_squeeze=True)
 
         self.rnn_out, self.rnn_out_last = None, None
 
-    def forward(self, x, mask, h, a=None, horizon_t=1):
-        x, h = self.feature_base(x, mask, h, horizon_t)
+    def forward(self, x, mask, h_in, last_a=None, a=None, horizon_t=1):
+        x, h_out = self.feature_base(x, mask, h_in, horizon_t)
+        last_a_one_hot = torch.zeros(x.shape[0],self.action_n,device=x.device)
+        if last_a:
+            last_a_one_hot.scatter_(dim=1,last_a.long().unsqueeze(-1),1.0)
+            last_a_one_hot = last_a_one_hot * mask
+        x = torch.cat((x,last_a_one_hot),dim=1)
         a, logp_a, ent = self.policy(x, a)
-        v = self.value_function(x).squeeze(dim=-1)
-        return a, logp_a, ent, v, h.squeeze()
+        v = self.value_function(x).squeeze()
+        return a, logp_a, ent, v, h_out.squeeze()
 
     def process_feature(self, x, mask, h, horizon_t=1):
         self.rnn_out, self.rnn_out_last = self.feature_base(x, mask, h, horizon_t)
@@ -188,7 +197,7 @@ class PPOBuffer:
 
     def __init__(self, obs_dim, size, num_envs, memory_size, gamma=0.99, lam=0.95):
         self.obs_buf = torch.zeros((size, *obs_dim), dtype=torch.float32).cuda()
-        self.act_buf = torch.zeros(size, dtype=torch.float32).cuda()
+        self.act_buf = torch.zeros(size, dtype=torch.long).cuda()
         self.adv_buf = torch.zeros(size, dtype=torch.float32).cuda()
         self.rew_buf = torch.zeros(size, dtype=torch.float32).cuda()
         self.ret_buf = torch.zeros(size, dtype=torch.float32).cuda()
@@ -285,12 +294,12 @@ class PPOBuffer:
             assert self.ptr.sum().item() == self.max_size  # buffer has to be full before you can get
             self.ptr.copy_(torch.zeros_like(self.ptr))
             self.path_start_idx.copy_(torch.zeros_like(self.path_start_idx))
-
+        last_a = torch.cat((torch.Tensor([0]).cuda(), self.act_buf[:-1]),dim=0)
         batch_sampler = BatchSampler( SubsetRandomSampler(range(self.max_size)), batch_size, drop_last=False)
         for idx in batch_sampler:
             yield [
                 self.obs_buf[idx], self.act_buf[idx], self.adv_buf[idx], self.ret_buf[idx],
-                self.logp_buf[idx], self.h_buf[idx], self.mask_buf[idx]
+                self.logp_buf[idx], self.h_buf[idx], self.mask_buf[idx], last_a[idx]
             ]
 
     def _discount_cumsum(self, x, discount):
