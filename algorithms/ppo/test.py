@@ -5,13 +5,18 @@ from algorithms.ppo.core import ActorCritic
 import sys
 
 
-def reset(env, rnn_size):
-    o, d, r = env.reset() / 255., False, 0.
-    mask_t = torch.Tensor([1.]).cuda()
-    o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
-    h_t = torch.zeros(rnn_size).cuda()
-    r_t = torch.Tensor([r]).cuda()
-    return o_t, r_t, h_t, mask_t, d
+def reset(env, state_size):
+    o, d, r = env.reset(), False, 0.
+    mask_t = torch.tensor(1.).cuda()
+    prev_a = torch.tensor(0).cuda()
+    obs_t = torch.Tensor(o/255.).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
+    state_t = torch.zeros(state_size).cuda()
+    reward_t = torch.tensor(r).cuda()
+    model_input={"current_obs":obs_t,
+                "prev_action":prev_a,
+                "pre_state":state_t,
+                "state_mask":mask_t}
+    return model_input, reward_t
 
 def tester(env, model, rnn_size, n = 5):
     env = AI2ThorEnv(config_file="config_files/OneMugTest.json")
@@ -19,18 +24,19 @@ def tester(env, model, rnn_size, n = 5):
     for _ in range(n):
         # Wait for trainer to inform next job
         total_r = 0.
-        o_t, r_t, h_t, mask_t, d = reset(env, rnn_size)
+        model_input, _ = reset(env, rnn_state_size)
         while not d:
             with torch.no_grad():
-                a_t, logp_t, _, v_t, h_t_next = model(o_t, mask_t, h_t)
+                a_t, _, _, _, state_t = model(model_input)
                 # interact with environment
                 o, r, d, _ = env.step(a_t.data.item())
-                o /= 255.
                 total_r += r  # accumulate reward within one rollout.
                 # prepare inputs for next step
-                mask_t = torch.Tensor([(d + 1) % 2]).cuda()
-                o_t = torch.Tensor(o).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
-                h_t = h_t_next
+                model_input["state_mask"] = torch.tensor((d+1)%2).cuda()
+                model_input["current_obs"] = torch.Tensor(o/255.).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
+                model_input["pre_state"] = state_t
+                model_input["pre_action"] = a_t
+
         episode_reward.append(total_r)
         print("Episode reward:", total_r)
 

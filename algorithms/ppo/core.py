@@ -50,49 +50,69 @@ class CNNRNNBase(nn.Module):
     The final output is then predicted value, action logits, hx and cx.
     """
 
-    def __init__(self, input_shape, output_size):
+    def __init__(self, obs_shape, output_size, action_dim=None):
         #  TODO: initialization weights and bias
         super(CNNRNNBase, self).__init__()
-        ch, w, h = input_shape
-        self.input_shape = input_shape
+        ch, w, h = obs_shape
+        self.cnn_input_shape = obs_shape
         self.conv1 = nn.Conv2d(ch, 32, 3, stride=2, padding=1)
         self.conv2 = nn.Conv2d(32, 32, 3, stride=2, padding=1)
         self.conv3 = nn.Conv2d(32, 32, 3, stride=2, padding=1)
         self.conv4 = nn.Conv2d(32, 32, 3, stride=2, padding=1)
 
+        self.action_dim = action_dim
         # assumes square image
         self.rnn_insize = calculate_output_size_after_4_conv_layers(w)
+        if self.action_dim:
+            self.rnn_insize += action_dim
         self.rnn_size = output_size
         self.rnn = nn.GRUCell(self.rnn_insize, self.rnn_size)
 
-    def forward(self, x, x_mask, h, horizon_t=1):
+    def forward(self, current_obs=None,
+                      prev_action=None,
+                      pre_state=None,
+                      state_mask=None,
+                      rnn_step_size=1):
+        # current_obs has shape [batch,ch, w, h]
+        # prev_action has shape [batch]
+        # state_mask has shape [batch]
+        # pre_state has shape   [batch, hidden_state_size]
 
-        # x has shape [batch,ch, w, h]
-        # x_mask has shape [batch]
-        # h has shape   [batch, hidden_state_size]
+        if len(current_obs.size()) == 3:  # if batch forgotten, with 1 time step
+            current_obs = current_obs.unsqueeze(0)
+            prev_action = prev_action.unsqueeze(0)
+            state_mask = state_mask.unsqueeze(0)
+            pre_state = pre_state.unsqueeze(0)
 
-        if len(x.size()) == 3:  # if batch forgotten, with 1 time step
-            x = x.unsqueeze(0)
-            x_mask = x_mask.unsqueeze(0)
-            h = h.unsqueeze(0)
+        cnn = F.elu(self.conv1(current_obs))
+        cnn = F.elu(self.conv2(cnn))
+        cnn = F.elu(self.conv3(cnn))
+        cnn = F.elu(self.conv4(cnn))
 
-        x = F.elu(self.conv1(x))
-        x = F.elu(self.conv2(x))
-        x = F.elu(self.conv3(x))
-        x = F.elu(self.conv4(x))
-
-        # convert back to time sequence for RNN cell
-        x = x.view(horizon_t, -1, self.rnn_insize)
-        x_mask = x_mask.view(horizon_t,-1,1)
-        h = h.view(horizon_t, -1, self.rnn_size)
+        batch, ch, w, h = cnn.shape
+        # flat cnn output layer
+        cnn= current_obs.view(cnn,-1)
+        # construct prev action into onehot vector
+        pre_action_onehot = torch.zeros(batch, self.action_dim, device=cnn.device)
+        pre_action_onehot.scatter_(dim=1, prev_action.long().unsqueeze(-1),1.0)
+        # reshape state_mask for broadcast
+        state_mask = state_mask.view(batch, 1)
+        # mask out previous action where state_mask is 0, i.e. first step
+        pre_action_onehot = pre_action_onehot * state_mask
+        # fuse observation with previous action
+        rnn_input = torch.cat((cnn,pre_action_onehot),dim=1)
+        # convert to time sequence for RNN cell
+        rnn_input = rnn_input.view(rnn_step_size, batch//rnn_step_size, -1)
+        # reshape state_mask for broadcast
+        state_mask = state_mask.view(rnn_step_size,batch//rnn_step_size, 1)
+        pre_state = pre_state.view(batch, batch//rnn_step_size, -1)
         outputs = []
-
-        h = h[0]  # use only the start state
+        state = pre_state[0]  # use only the start state
         for t in range(horizon_t):
-            out = h = self.rnn(x[t], h * x_mask[t])
-            outputs.append(out)
-        outputs = torch.stack(outputs, dim=0)
-        return outputs.view(-1, self.rnn_size), h.view(-1, self.rnn_size)
+            state = self.rnn(rnn_input[t], state * state_mask[t])
+            outputs.append(state)
+        states = torch.stack(outputs, dim=0)
+        return states
 
 
 class MLP(nn.Module):
@@ -142,51 +162,37 @@ class CategoricalPolicy(nn.Module):
 
 class ActorCritic(nn.Module):
     def __init__(self,
-                 in_features,
+                 obs_shape,
                  action_space,
                  hidden_sizes=(64, 64),
-                 memory_size = 128,
+                 state_size = 128,
                  activation=torch.tanh,
                  output_activation=None):
         super(ActorCritic, self).__init__()
 
         self.feature_base = CNNRNNBase(
-            input_shape=in_features,
-            output_size=memory_size
+            obs_shape=obs_shape,
+            action_dim=action_space.n,
+            output_size=state_size
         )
-        # add last action as input
-        self.action_n = action_space.n
-        self.base_out_size = action_space.n + memory_size
 
         self.policy = CategoricalPolicy(
-                self.base_out_size,
+                state_size,
                 hidden_sizes,
                 activation,
                 output_activation,
                 action_dim=action_space.n)
 
         self.value_function = MLP(
-            layers=[self.base_out_size] + list(hidden_sizes) + [1],
+            layers=[state_size] + list(hidden_sizes) + [1],
             activation=activation,
             output_squeeze=True)
 
-        self.rnn_out, self.rnn_out_last = None, None
-
-    def forward(self, x, mask, h_in, last_a=None, a=None, horizon_t=1):
-        x, h_out = self.feature_base(x, mask, h_in, horizon_t)
-        last_a_one_hot = torch.zeros(x.shape[0],self.action_n,device=x.device)
-        if last_a:
-            last_a_one_hot.scatter_(dim=1,last_a.long().unsqueeze(-1),1.0)
-            last_a_one_hot = last_a_one_hot * mask
-        x = torch.cat((x,last_a_one_hot),dim=1)
-        a, logp_a, ent = self.policy(x, a)
-        v = self.value_function(x).squeeze()
-        return a, logp_a, ent, v, h_out.squeeze()
-
-    def process_feature(self, x, mask, h, horizon_t=1):
-        self.rnn_out, self.rnn_out_last = self.feature_base(x, mask, h, horizon_t)
-        return self.rnn_out, self.rnn_out_last
-
+    def forward(self, input=dict(), a=None, horizon_t=1):
+        states = self.feature_base(**input, rnn_step_size=horizon_t)
+        a, logp_a, ent = self.policy(states, a)
+        v = self.value_function(states)
+        return a, logp_a, ent, v, states[-1]
 
 class PPOBuffer:
     """
@@ -294,12 +300,12 @@ class PPOBuffer:
             assert self.ptr.sum().item() == self.max_size  # buffer has to be full before you can get
             self.ptr.copy_(torch.zeros_like(self.ptr))
             self.path_start_idx.copy_(torch.zeros_like(self.path_start_idx))
-        last_a = torch.cat((torch.Tensor([0]).cuda(), self.act_buf[:-1]),dim=0)
+        pre_a = torch.cat((torch.Tensor([0]).cuda(), self.act_buf[:-1]),dim=0)
         batch_sampler = BatchSampler( SubsetRandomSampler(range(self.max_size)), batch_size, drop_last=False)
         for idx in batch_sampler:
             yield [
                 self.obs_buf[idx], self.act_buf[idx], self.adv_buf[idx], self.ret_buf[idx],
-                self.logp_buf[idx], self.h_buf[idx], self.mask_buf[idx], last_a[idx]
+                self.logp_buf[idx], self.h_buf[idx], self.mask_buf[idx], pre_a[idx]
             ]
 
     def _discount_cumsum(self, x, discount):
