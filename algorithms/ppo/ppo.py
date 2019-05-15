@@ -11,73 +11,67 @@ from torch.nn.parallel import DistributedDataParallel
 import torch.distributed as dist
 from torch.multiprocessing import SimpleQueue, Event, Process, Value
 
-"""
-Proximal Policy Optimization (by clipping),
 
-with early stopping based on approximate KL
-
-"""
-
+# Proximal Policy Optimization (by clipping),
+# with early stopping based on approximate KL
 
 def reset(env, state_size):
-    o, d, r = env.reset(), False, 0.
-    mask_t = torch.tensor(1.).cuda()
-    prev_a = torch.tensor(0).cuda()
+    o, _, r = env.reset(), False, 0.
+    mask_t = torch.tensor(1.,dtype=torch.float32).cuda()
+    prev_a = torch.tensor(0, dtype=torch.long).cuda()
     obs_t = torch.Tensor(o/255.).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
-    state_t = torch.zeros(state_size).cuda()
-    reward_t = torch.tensor(r).cuda()
+    state_t = torch.zeros(state_size,dtype=torch.float32).cuda()
+    reward_t = torch.tensor(r,dtype=torch.float32).cuda()
     model_input={"current_obs":obs_t,
-                "prev_action":prev_a,
+                "pre_action":prev_a,
                 "pre_state":state_t,
                 "state_mask":mask_t}
     return model_input, reward_t
 
 
-def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue, exit_flag):
+def actor(envid, gpuid, model, buf, sync_ev, queue, exitflag):
     print(f"Start actor with pid ({os.getpid()}) ...")
 
     steps_per_epoch = buf.block_size
     rnn_state_size = buf.h_buf.shape[1]
     torch.cuda.set_device(gpuid)
     env = AI2ThorEnv(config_file="config_files/OneMug.json")
-    model_input, r_t = reset(env, rnn_state_size)
+    inputs, r_t = reset(env, rnn_state_size)
     total_r = 0.
     episode_steps = 0
     while True:
         # Wait for next job
         sync_ev.wait()
-        if exit_flag.value == 1:
+        if exitflag.value == 1:
             env.close()
             break
         for t in range(steps_per_epoch):
             with torch.no_grad():
-                a_t, logp_t, _, v_t, state_t = model(**model_input)
+                a_t, logp_t, _, v_t, state_t = model(inputs)
                 # save experience
-                obs_t = model_input["current_obs"]
-                mask_t = model_input["state_mask"]
-                buf.store(env_id, obs_t, a_t, r_t, v_t, logp_t, state_t, mask_t)
+                buf.store(envid, inputs["current_obs"], a_t, r_t, v_t, logp_t, inputs["pre_state"], inputs["state_mask"])
                 # interact with environment
                 o, r, d, _ = env.step(a_t.item())
                 total_r += r  # accumulate reward within one rollout.
                 episode_steps += 1
                 # prepare inputs for next step
-                model_input["state_mask"] = torch.tensor((d+1)%2).cuda()
-                model_input["current_obs"] = torch.Tensor(o/255.).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
-                model_input["pre_state"] = state_t
-                model_input["pre_action"] = a_t
-                r_t = torch.tensor(r).cuda()
+                inputs["current_obs"] = torch.Tensor(o/255.).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
+                inputs["state_mask"] = torch.tensor((d+1)%2,dtype=torch.float32).cuda()
+                inputs["pre_state"] = state_t
+                inputs["pre_action"] = a_t
+                r_t = torch.tensor(r, dtype=torch.float32).cuda()
 
                 # check terminal state
                 epoch_end = (t == (steps_per_epoch - 1))
                 if d: # calculate the returns and GAE and reset environment
-                    buf.finish_path(env_id, r)
+                    buf.finish_path(envid, r)
                     msg = {"msg_type":"train", "reward":total_r, "steps":episode_steps, "epoch_end":epoch_end}
                     queue.put(msg)
-                    model_input, r_t = reset(env, rnn_state_size)
+                    inputs, r_t = reset(env, rnn_state_size)
                     total_r, episode_steps = 0., 0
                 elif epoch_end: # early cut due to reach maximum steps in on epoch
-                    _, _, _, last_val, _ = model(o_t, mask_t, h_t)
-                    buf.finish_path(env_id, last_val)
+                    _, _, _, last_val, _ = model(inputs)
+                    buf.finish_path(envid, last_val)
                     total_r += last_val.item()
                     msg = {"msg_type":"train", "reward":None, "steps":episode_steps, "epoch_end":epoch_end}
                     queue.put(msg)
@@ -85,32 +79,32 @@ def actor(env_id, gpuid, model, buf, epochs, sync_ev, queue, exit_flag):
         sync_ev.clear()  
     print(f"actor with pid ({os.getpid()})  finished job")
 
-def tester(gpuid, model, rnn_size, sync_ev, queue, exit_flag):
+def tester(gpuid, model, rnn_size, sync_ev, queue, exitflag):
     print(f"Start tester with pid ({os.getpid()}) ...")
     torch.cuda.set_device(gpuid)
     env = AI2ThorEnv(config_file="config_files/OneMugTest.json")
 
     while True:
         # Wait for trainer to inform next job
-        total_r, episode_steps = 0., 0
-        model_input, _ = reset(env, rnn_size)
+        total_r, episode_steps, d = 0., 0, False
+        inputs, _ = reset(env, rnn_size)
         sync_ev.wait()
-        if exit_flag.value == 1 :
+        if exitflag.value == 1 :
             env.close()
             break
 
         while not d:
             with torch.no_grad():
-                a_t, _, _, _, state_t = model(model_input)
+                a_t, _, _, _, state_t = model(inputs)
                 # interact with environment
                 o, r, d, _ = env.step(a_t.item())
                 total_r += r  # accumulate reward within one rollout.
                 episode_steps +=1
                 # prepare inputs for next step
-                model_input["state_mask"] = torch.tensor((d+1)%2).cuda()
-                model_input["current_obs"] = torch.Tensor(o/255.).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
-                model_input["pre_state"] = state_t
-                model_input["pre_action"] = a_t
+                inputs["state_mask"] = torch.tensor((d+1)%2, dtype=torch.float32).cuda()
+                inputs["current_obs"] = torch.Tensor(o/255.).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
+                inputs["pre_state"] = state_t
+                inputs["pre_action"] = a_t
                 
         msg = {"msg_type": "test", "reward": total_r, "steps": episode_steps, "epoch_end": True}
         queue.put(msg)
@@ -119,43 +113,43 @@ def tester(gpuid, model, rnn_size, sync_ev, queue, exit_flag):
     print(f"Tester with pid ({os.getpid()})  finished job")
 
 
-def learner(model, exp_buf, args, sync_evs, sync_tester_ev, ret_queue, exit_flag):
+def learner(model, buf, params, actor_evs, tester_ev, queue, exitflag):
     print(f"learner with pid ({os.getpid()})  starts job")
-    if args.rank == 0:
+    if params.rank == 0:
         writer = SummaryWriter(comment="ai2thor_ppo")
 
-    cr, alpha, beta, target_kl = args.clip_ratio, args.alpha,a rgs.beta ,args.target_kl
+    cr, alpha, beta, target_kl = params.clip_ratio, params.alpha,params.beta ,params.target_kl
     # Optimizers
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=params.lr)
     # average across nodes and multiple gpus
 
     def dist_sum(x):
-        if args.world_size > 1:
+        if params.world_size > 1:
             dist.all_reduce(x, dist.ReduceOp.SUM)
         return x
 
     def dist_mean(x):
-        return dist_sum(x)/args.world_size
+        return dist_sum(x)/params.world_size
 
     # start workers for next epoch
-    [ev.set() for ev in sync_evs]
-    if args.testing:
-        sync_tester_ev.set()
+    _ = [ev.set() for ev in actor_evs]
+    if params.testing:
+        tester_ev.set()
         test_cycle= 5
     # Training policy
     start_time = time.time()
-    for epoch in range(args.epochs):
+    for epoch in range(params.epochs):
         rollout_ret = []
         rollout_steps = []
         # wait until all workers finish a epoch
-        finished_worker = args.num_envs
+        finished_worker = params.num_envs
 
-        if args.testing and epoch%test_cycle == 0:
+        if params.testing and epoch%test_cycle == 0:
             test_ret = []
             finished_worker += 1
 
         while finished_worker > 0:
-            msg = ret_queue.get()
+            msg = queue.get()
             if msg["msg_type"] == "train":
                 if msg["reward"] and msg["steps"]:
                     rollout_ret.append(msg["reward"])
@@ -178,8 +172,8 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev, ret_queue, exit_flag
 
         # train with batch
         model.train()
-        for i in range(args.train_iters):
-            batch_gen = exp_buf.batch_generator(args.batch_size)
+        for i in range(params.train_iters):
+            batch_gen = buf.batch_generator(params.batch_size)
             kl_sum, ent_sum, pi_loss_sum, v_loss_sum = [torch.tensor(0.0).cuda() for _ in range(4)]
 
             for batch in batch_gen:
@@ -190,7 +184,7 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev, ret_queue, exit_flag
                 model_input["pre_state"] = pre_state
                 model_input["pre_action"] = pre_a
             
-                _, logp_a, ent, v, _ = model(model_input, a=act, horizon_t=args.rnn_steps)
+                _, logp_a, ent, v, _ = model(model_input, a=act, horizon_t=params.rnn_steps)
                 # PPO policy objective
                 ratio = (logp_a - logp_old).exp()
                 min_adv = torch.where(adv > 0, (1 + cr) * adv, (1 - cr) * adv)
@@ -210,7 +204,7 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev, ret_queue, exit_flag
                     pi_loss_sum += pi_loss * batch_size
                     v_loss_sum += v_loss * batch_size
 
-            kl_mean = kl_sum / exp_buf.max_size
+            kl_mean = kl_sum / buf.max_size
             kl_mean = dist_mean(kl_mean)
             if torch.abs(kl_mean) > 1.5 * target_kl:
                 print(f'Early stopping at iter ({i} /{args.train_iters}) due to reaching max kl. ({kl_mean:.4f})')
@@ -220,26 +214,26 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev, ret_queue, exit_flag
         model.eval()
 
         # set the tester, actor processes to exit
-        if epoch == args.epochs -1:
-            exit_flag.value = 1
-            if args.testing:
-                sync_tester_ev.set()
+        if epoch == params.epochs -1:
+            exitflag.value = 1
+            if params.testing:
+                tester_ev.set()
 
-        if args.testing and (epoch+1)%test_cycle == 0:
-            sync_tester_ev.set()
-        [ev.set() for ev in sync_evs]
+        if params.testing and (epoch+1)%test_cycle == 0:
+            tester_ev.set()
+        _ = [ev.set() for ev in actor_evs]
 
         # calculate statistics
         # kl_mean = kl_sum / exp_buf.max_size
-        ent_avg = ent_sum/exp_buf.max_size
-        pi_loss_avg = pi_loss_sum/exp_buf.max_size
-        v_loss_avg = v_loss_sum/exp_buf.max_size
+        ent_avg = ent_sum/buf.max_size
+        pi_loss_avg = pi_loss_sum/buf.max_size
+        v_loss_avg = v_loss_sum/buf.max_size
         # kl_mean = distributed_avg(kl_mean)
         ent_avg = dist_mean(ent_avg)
         pi_loss_avg = dist_mean(pi_loss_avg)
         v_loss_avg = dist_mean(v_loss_avg)
         # Log info about epoch
-        global_steps = (epoch + 1)* args.steps * args.world_size
+        global_steps = (epoch + 1)* params.steps * params.world_size
         avg_ret_by_1000 = None
         avg_steps = None
         avg_test_rewards = None
@@ -260,13 +254,13 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev, ret_queue, exit_flag
             print(f"Epoch [{epoch}] Steps {global_steps}: "
                   f"No reward is collected, very bad")
       
-        if args.testing:
+        if params.testing:
             avg_test_rewards = np.mean(test_ret)
             avg_test_rewards = dist_mean(torch.Tensor([avg_test_rewards]).cuda())
             print(f"Epoch [{epoch}] Steps {global_steps}: Rewards1000:({avg_test_rewards.item():.1f})")
 
-        if args.rank == 0:
-            fps = global_steps*args.world_size/(time.time()-start_time)
+        if params.rank == 0:
+            fps = global_steps*params.world_size/(time.time()-start_time)
             print(f"Epoch [{epoch}] avg. FPS:[{fps:.2f}]")
             writer.add_scalar("KL", kl_mean, global_steps)
             writer.add_scalar("Entropy", ent_avg, global_steps)
@@ -275,11 +269,11 @@ def learner(model, exp_buf, args, sync_evs, sync_tester_ev, ret_queue, exit_flag
             if avg_ret_by_1000:
                 writer.add_scalar("Return1000", avg_ret_by_1000, global_steps)
                 writer.add_scalar("EpisodeSteps", avg_steps, global_steps)
-            if args.testing and avg_test_rewards:
+            if params.testing and avg_test_rewards:
                 writer.add_scalar("Rewards1000", avg_test_rewards, global_steps)
             
             if (epoch +1) % 20 == 0:
-                if args.world_size > 0:
+                if params.world_size > 0:
                     torch.save(model.module.state_dict(), f'model{epoch}.pt') 
                 else:
                     torch.save(model.state_dict(), f'model{epoch}.pt') 
@@ -299,8 +293,8 @@ if __name__ == '__main__':
     parser.add_argument('--world-size', type=int, default=1)
     parser.add_argument('--rank', type=int, default=0)
     parser.add_argument('--gpuid', type=int, default=0)
-    parser.add_argument('--steps', type=int, default=2048)
-    parser.add_argument('--num-envs', type=int, default=4)
+    parser.add_argument('--steps', type=int, default=512)
+    parser.add_argument('--num-envs', type=int, default=1)
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--model-path', type=str, default=None)
@@ -331,13 +325,13 @@ if __name__ == '__main__':
     # Establish Local Rank and set device on this node, i.e. the GPU index
     torch.cuda.set_device(args.gpuid)
     # get observation dimension
-    env = AI2ThorEnv(config_file="config_files/OneMug.json")
-    obs_dim = env.observation_space.shape
+    env1 = AI2ThorEnv(config_file="config_files/OneMug.json")
+    obs_dim = env1.observation_space.shape
     # Share information about action space with policy architecture
     ac_kwargs = dict(hidden_sizes=[args.hid] * args.l)
-    ac_kwargs['action_space'] = env.action_space
+    ac_kwargs['action_space'] = env1.action_space
     ac_kwargs['state_size'] = args.state_size
-    env.close()
+    env1.close()
     # Main model
     print("Initialize Model...")
     # Construct Model
@@ -351,8 +345,8 @@ if __name__ == '__main__':
         var_counts = tuple(count_vars(m) for m in [ac_model.policy, ac_model.value_function, ac_model.feature_base])
         print('\nNumber of parameters: \t pi: %d, \t v: %d \tbase: %d\n' % var_counts)
     # Experience buffer
-    buf = PPOBuffer(obs_dim, args.steps, args.num_envs, args.rnn_size, args.gamma)
-    buf.share_memory()
+    exp_buf = PPOBuffer(obs_dim, args.steps, args.num_envs, args.state_size, args.gamma)
+    exp_buf.share_memory()
     # Make model DistributedDataParallel
     if args.world_size > 1:
         d_model = DistributedDataParallel(ac_model, device_ids=[args.gpuid], output_device=args.gpuid)
@@ -360,15 +354,15 @@ if __name__ == '__main__':
         d_model = ac_model
     # start multiple processes
     sync_actor_evs = [Event() for _ in range(args.num_envs)]
-    [ev.clear() for ev in sync_actor_evs]
+    _ = [ev.clear() for ev in sync_actor_evs]
     exit_flag = Value('i',0)
     ret_queue = SimpleQueue()
 
     processes = []
     #start actors
     for env_id in range(args.num_envs):
-        p = Process(target=actor, args=(env_id, args.gpuid, ac_model, buf, args.epochs,
-                                        sync_actor_evs[env_id], ret_queue,exit_flag))
+        p = Process(target=actor, args=(env_id, args.gpuid, ac_model, exp_buf,
+                                        sync_actor_evs[env_id], ret_queue, exit_flag))
         p.start()
         processes.append(p)
     #start tester
@@ -380,7 +374,7 @@ if __name__ == '__main__':
         p.start()
         processes.append(p)
     # start trainer
-    learner(d_model, buf,args, sync_actor_evs, sync_tester_ev, ret_queue, exit_flag)
+    learner(d_model, exp_buf,args, sync_actor_evs, sync_tester_ev, ret_queue, exit_flag)
 
     for p in processes:
         print("process ", p.pid, " joined")

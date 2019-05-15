@@ -53,7 +53,7 @@ class CNNRNNBase(nn.Module):
     def __init__(self, obs_shape, output_size, action_dim=None):
         #  TODO: initialization weights and bias
         super(CNNRNNBase, self).__init__()
-        ch, w, h = obs_shape
+        ch, w, _ = obs_shape
         self.cnn_input_shape = obs_shape
         self.conv1 = nn.Conv2d(ch, 32, 3, stride=2, padding=1)
         self.conv2 = nn.Conv2d(32, 32, 3, stride=2, padding=1)
@@ -68,19 +68,15 @@ class CNNRNNBase(nn.Module):
         self.rnn_size = output_size
         self.rnn = nn.GRUCell(self.rnn_insize, self.rnn_size)
 
-    def forward(self, current_obs=None,
-                      prev_action=None,
-                      pre_state=None,
-                      state_mask=None,
+    def forward(self, current_obs, pre_action, pre_state, state_mask,
                       rnn_step_size=1):
         # current_obs has shape [batch,ch, w, h]
-        # prev_action has shape [batch]
+        # pre_action has shape [batch]
         # state_mask has shape [batch]
         # pre_state has shape   [batch, hidden_state_size]
-
         if len(current_obs.size()) == 3:  # if batch forgotten, with 1 time step
             current_obs = current_obs.unsqueeze(0)
-            prev_action = prev_action.unsqueeze(0)
+            pre_action = pre_action.unsqueeze(0)
             state_mask = state_mask.unsqueeze(0)
             pre_state = pre_state.unsqueeze(0)
 
@@ -89,12 +85,12 @@ class CNNRNNBase(nn.Module):
         cnn = F.elu(self.conv3(cnn))
         cnn = F.elu(self.conv4(cnn))
 
-        batch, ch, w, h = cnn.shape
+        batch = current_obs.shape[0]
         # flat cnn output layer
-        cnn= current_obs.view(cnn,-1)
+        cnn= cnn.view(batch, -1)
         # construct prev action into onehot vector
-        pre_action_onehot = torch.zeros(batch, self.action_dim, device=cnn.device)
-        pre_action_onehot.scatter_(dim=1, prev_action.long().unsqueeze(-1),1.0)
+        pre_action_onehot = torch.zeros(batch, self.action_dim, device=cnn.device, dtype=torch.float32)
+        pre_action_onehot.scatter_(1, pre_action.long().unsqueeze(-1), 1.0)
         # reshape state_mask for broadcast
         state_mask = state_mask.view(batch, 1)
         # mask out previous action where state_mask is 0, i.e. first step
@@ -104,14 +100,15 @@ class CNNRNNBase(nn.Module):
         # convert to time sequence for RNN cell
         rnn_input = rnn_input.view(rnn_step_size, batch//rnn_step_size, -1)
         # reshape state_mask for broadcast
-        state_mask = state_mask.view(rnn_step_size,batch//rnn_step_size, 1)
-        pre_state = pre_state.view(batch, batch//rnn_step_size, -1)
+        state_mask = state_mask.view(rnn_step_size, batch//rnn_step_size, 1)
+        pre_state = pre_state.view(rnn_step_size, batch//rnn_step_size, -1)
         outputs = []
         state = pre_state[0]  # use only the start state
-        for t in range(horizon_t):
+        for t in range(rnn_step_size):
             state = self.rnn(rnn_input[t], state * state_mask[t])
             outputs.append(state)
         states = torch.stack(outputs, dim=0)
+        states = states.view(-1,self.rnn_size)
         return states
 
 
@@ -131,8 +128,8 @@ class MLP(nn.Module):
             self.layers.append(nn.Linear(layers[i], layer))
             nn.init.zeros_(self.layers[i].bias)
 
-    def forward(self, input):
-        x = input
+    def forward(self, x0):
+        x = x0
         for layer in self.layers[:-1]:
             x = self.activation(layer(x))
         if self.output_activation is None:
@@ -188,8 +185,8 @@ class ActorCritic(nn.Module):
             activation=activation,
             output_squeeze=True)
 
-    def forward(self, input=dict(), a=None, horizon_t=1):
-        states = self.feature_base(**input, rnn_step_size=horizon_t)
+    def forward(self, inputs, a=None, horizon_t=1):
+        states = self.feature_base(**inputs, rnn_step_size=horizon_t)
         a, logp_a, ent = self.policy(states, a)
         v = self.value_function(states)
         return a, logp_a, ent, v, states[-1]
@@ -300,7 +297,7 @@ class PPOBuffer:
             assert self.ptr.sum().item() == self.max_size  # buffer has to be full before you can get
             self.ptr.copy_(torch.zeros_like(self.ptr))
             self.path_start_idx.copy_(torch.zeros_like(self.path_start_idx))
-        pre_a = torch.cat((torch.Tensor([0]).cuda(), self.act_buf[:-1]),dim=0)
+        pre_a = torch.cat((torch.tensor([0],dtype=torch.long).cuda(), self.act_buf[:-1]),dim=0)
         batch_sampler = BatchSampler( SubsetRandomSampler(range(self.max_size)), batch_size, drop_last=False)
         for idx in batch_sampler:
             yield [
