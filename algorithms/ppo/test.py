@@ -6,14 +6,14 @@ import sys
 
 
 def reset(env, state_size):
-    o, d, r = env.reset(), False, 0.
-    mask_t = torch.tensor(1.).cuda()
-    prev_a = torch.tensor(0).cuda()
+    o, _, r = env.reset(), False, 0.
+    mask_t = torch.tensor(1.,dtype=torch.float32).cuda()
+    prev_a = torch.tensor(0, dtype=torch.long).cuda()
     obs_t = torch.Tensor(o/255.).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
-    state_t = torch.zeros(state_size).cuda()
-    reward_t = torch.tensor(r).cuda()
+    state_t = torch.zeros(state_size,dtype=torch.float32).cuda()
+    reward_t = torch.tensor(r,dtype=torch.float32).cuda()
     model_input={"current_obs":obs_t,
-                "prev_action":prev_a,
+                "pre_action":prev_a,
                 "pre_state":state_t,
                 "state_mask":mask_t}
     return model_input, reward_t
@@ -24,7 +24,8 @@ def tester(env, model, rnn_size, n = 5):
     for _ in range(n):
         # Wait for trainer to inform next job
         total_r = 0.
-        model_input, _ = reset(env, rnn_state_size)
+        d = False
+        model_input, _ = reset(env, rnn_size)
         while not d:
             with torch.no_grad():
                 a_t, _, _, _, state_t = model(model_input)
@@ -32,7 +33,7 @@ def tester(env, model, rnn_size, n = 5):
                 o, r, d, _ = env.step(a_t.data.item())
                 total_r += r  # accumulate reward within one rollout.
                 # prepare inputs for next step
-                model_input["state_mask"] = torch.tensor((d+1)%2).cuda()
+                model_input["state_mask"] = torch.tensor((d+1)%2,dtype=torch.float32).cuda()
                 model_input["current_obs"] = torch.Tensor(o/255.).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
                 model_input["pre_state"] = state_t
                 model_input["pre_action"] = a_t
@@ -57,9 +58,9 @@ if __name__ == '__main__':
     rnn_size= 128
     ac_kwargs = dict(hidden_sizes=[64] * 2)
     ac_kwargs['action_space'] = env.action_space
-    ac_kwargs['memory_size'] = rnn_size
+    ac_kwargs['state_size'] = rnn_size
     # Construct Model
-    ac_model = ActorCritic(in_features=obs_dim, **ac_kwargs).cuda()
+    ac_model = ActorCritic(obs_shape=obs_dim, **ac_kwargs).cuda()
     state_dict = torch.load(args.model_path)
     # load params
     ac_model.load_state_dict(state_dict)

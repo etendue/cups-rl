@@ -294,7 +294,7 @@ class PPOBuffer:
         the buffer. Also, resets some pointers in the buffer.
         """
         if self.ptr.sum().item() != 0:
-            assert self.ptr.sum().item() == self.max_size  # buffer has to be full before you can get
+            assert self.ptr.sum().item() == self.max_size, f'expected size:{self.max_size}, actual:{self.ptr.sum().item()}' 
             self.ptr.copy_(torch.zeros_like(self.ptr))
             self.path_start_idx.copy_(torch.zeros_like(self.path_start_idx))
         pre_a = torch.cat((torch.tensor([0],dtype=torch.long).cuda(), self.act_buf[:-1]),dim=0)

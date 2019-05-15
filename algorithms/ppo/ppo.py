@@ -273,7 +273,7 @@ def learner(model, buf, params, actor_evs, tester_ev, queue, exitflag):
                 writer.add_scalar("Rewards1000", avg_test_rewards, global_steps)
             
             if (epoch +1) % 20 == 0:
-                if params.world_size > 0:
+                if params.world_size > 1:
                     torch.save(model.module.state_dict(), f'model{epoch}.pt') 
                 else:
                     torch.save(model.state_dict(), f'model{epoch}.pt') 
@@ -293,8 +293,8 @@ if __name__ == '__main__':
     parser.add_argument('--world-size', type=int, default=1)
     parser.add_argument('--rank', type=int, default=0)
     parser.add_argument('--gpuid', type=int, default=0)
-    parser.add_argument('--steps', type=int, default=512)
-    parser.add_argument('--num-envs', type=int, default=1)
+    parser.add_argument('--steps', type=int, default=2048)
+    parser.add_argument('--num-envs', type=int, default=4)
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--model-path', type=str, default=None)
