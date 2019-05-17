@@ -38,6 +38,10 @@ def normalized_columns_initializer(weights, std=1.0):
     out *= std / torch.sqrt(out.pow(2).sum(1, keepdim=True))
     return out
 
+def init(module, weight_init, bias_init, gain=1):
+    weight_init(module.weight.data, gain=gain)
+    bias_init(module.bias.data)
+    return module
 
 class CNNRNNBase(nn.Module):
     """
@@ -53,12 +57,14 @@ class CNNRNNBase(nn.Module):
     def __init__(self, obs_shape, output_size, action_dim=None):
         #  TODO: initialization weights and bias
         super(CNNRNNBase, self).__init__()
+        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+                               constant_(x, 0), nn.init.calculate_gain('relu'))
         ch, w, _ = obs_shape
         self.cnn_input_shape = obs_shape
-        self.conv1 = nn.Conv2d(ch, 32, 3, stride=2, padding=1)
-        self.conv2 = nn.Conv2d(32, 32, 3, stride=2, padding=1)
-        self.conv3 = nn.Conv2d(32, 32, 3, stride=2, padding=1)
-        self.conv4 = nn.Conv2d(32, 32, 3, stride=2, padding=1)
+        self.conv1 = init_(nn.Conv2d(ch, 32, 3, stride=2, padding=1))
+        self.conv2 = init_(nn.Conv2d(32, 32, 3, stride=2, padding=1))
+        self.conv3 = init_(nn.Conv2d(32, 32, 3, stride=2, padding=1))
+        self.conv4 = init_(nn.Conv2d(32, 32, 3, stride=2, padding=1))
 
         self.action_dim = action_dim
         # assumes square image
@@ -67,6 +73,11 @@ class CNNRNNBase(nn.Module):
             self.rnn_insize += action_dim
         self.rnn_size = output_size
         self.rnn = nn.GRUCell(self.rnn_insize, self.rnn_size)
+        for name, param in self.rnn.named_parameters():
+            if 'bias' in name:
+                nn.init.constant_(param, 0)
+            elif 'weight' in name:
+                nn.init.orthogonal_(param)
 
     def forward(self, current_obs, pre_action, pre_state, state_mask,
                       rnn_step_size=1):
@@ -288,7 +299,7 @@ class PPOBuffer:
             std = mean_std[1]
         self.adv_buf = (self.adv_buf - mean)/(std +epsilon)
 
-    def batch_generator(self, batch_size):
+    def batch_generator(self, batch_size, num_steps=1):
         """
         Call this at the end of an epoch to get all of the data from
         the buffer. Also, resets some pointers in the buffer.
@@ -298,8 +309,11 @@ class PPOBuffer:
             self.ptr.copy_(torch.zeros_like(self.ptr))
             self.path_start_idx.copy_(torch.zeros_like(self.path_start_idx))
         pre_a = torch.cat((torch.tensor([0],dtype=torch.long).cuda(), self.act_buf[:-1]),dim=0)
-        batch_sampler = BatchSampler( SubsetRandomSampler(range(self.max_size)), batch_size, drop_last=False)
-        for idx in batch_sampler:
+        num_blocks = self.max_size//num_steps
+        indice = torch.arange(self.max_size).view(-1,num_steps)
+        batch_sampler = BatchSampler( SubsetRandomSampler(range(num_blocks)), batch_size//num_steps, drop_last=False)
+        for block in batch_sampler:
+            idx = indice[block].view(-1)
             yield [
                 self.obs_buf[idx], self.act_buf[idx], self.adv_buf[idx], self.ret_buf[idx],
                 self.logp_buf[idx], self.h_buf[idx], self.mask_buf[idx], pre_a[idx]
