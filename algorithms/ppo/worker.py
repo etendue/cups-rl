@@ -92,6 +92,8 @@ def worker(worker_id,
         ready_to_work.clear()
         ready_to_work.wait()
 
+    env.close()
+
     print(f"Worker with pid ({os.getpid()})  finished job")
 
 

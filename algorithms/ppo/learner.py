@@ -72,6 +72,10 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
         model.eval()
 
         # start workers for next epoch
+        if epoch == train_params["epochs"] -1:
+            # set exit flag to 1, and notify workers to exit
+            sync_flag.value = 1
+
         _ = [e.set() for e in ready_to_works]
 
         # log statistics with TensorBoard
@@ -112,9 +116,5 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
                 torch.save(model.module.state_dict(), f'model{epoch+1}.pt')
             else:
                 torch.save(model.state_dict(), f'model{epoch+1}.pt')
-
-    # set exit flag to 1, and notify workers to exit
-    sync_flag.value = 1
-    _ = [e.set() for e in ready_to_works]
 
     print(f"learner with pid ({os.getpid()})  finished job")
