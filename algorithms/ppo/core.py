@@ -178,6 +178,8 @@ class ActorCritic(nn.Module):
                  output_activation=None):
         super(ActorCritic, self).__init__()
 
+        self.obs_shape =obs_shape
+
         self.feature_base = CNNRNNBase(
             obs_shape=obs_shape,
             action_dim=action_space.n,
@@ -196,9 +198,13 @@ class ActorCritic(nn.Module):
             activation=activation,
             output_squeeze=True)
 
-    def forward(self, inputs, a=None, horizon_t=1):
-        states = self.feature_base(**inputs, rnn_step_size=horizon_t)
-        a, logp_a, ent = self.policy(states, a)
+    def forward(self, inputs, action=None, rnn_step_size=1):
+        current_obs = inputs["observation"]
+        pre_action = inputs["memory"]["action"]
+        pre_state = inputs["memory"]["state"]
+        state_mask = inputs["memory"]["mask"]
+        states = self.feature_base(current_obs, pre_action, pre_state, state_mask, rnn_step_size=rnn_step_size)
+        a, logp_a, ent = self.policy(states, action)
         v = self.value_function(states)
         return a, logp_a, ent, v, states[-1]
 
