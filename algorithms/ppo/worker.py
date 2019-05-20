@@ -3,12 +3,13 @@ import numpy as np
 import torch
 from gym_ai2thor.envs.ai2thor_env import AI2ThorEnv
 
-def reset(env, state_size):
+
+def reset(env, state_size, device):
     o = env.reset()
-    mask_t = torch.tensor(0., dtype=torch.float32).cuda()
-    prev_a = torch.tensor(0, dtype=torch.long).cuda()
-    obs_t = torch.Tensor(o / 255.).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
-    state_t = torch.zeros(state_size, dtype=torch.float32).cuda()
+    mask_t = torch.tensor(0., dtype=torch.float32).to(device)
+    prev_a = torch.tensor(0, dtype=torch.long).to(device)
+    obs_t = torch.Tensor(o / 255.).to(device).unsqueeze(dim=0)  # -> 1x128x128
+    state_t = torch.zeros(state_size, dtype=torch.float32).to(device)
     x = {"observation": obs_t,
          "memory": {
              "state": state_t,
@@ -42,9 +43,10 @@ def worker(worker_id,
 
     steps_per_epoch = storage.block_size
     state_size = storage.h_buf.shape[1]
+    device = storage.device
     
     env = AI2ThorEnv(config_file=task_config_file)
-    x = reset(env, state_size)
+    x = reset(env, state_size, device)
     episode_rewards, episode_steps = [], []
     r_sum, step_sum = 0., 0
 
@@ -58,7 +60,7 @@ def worker(worker_id,
                 o, r, d, _ = env.step(a_t.item())
                 r_sum += r  # accumulate reward within one rollout.
                 step_sum += 1
-                r_t = torch.tensor(r, dtype=torch.float32).cuda()
+                r_t = torch.tensor(r, dtype=torch.float32).to(device)
                 # save experience
                 storage.store(worker_id,
                               x["observation"],
@@ -69,9 +71,9 @@ def worker(worker_id,
                               x["memory"]["state"],
                               x["memory"]["mask"])
                 # prepare inputs for next step
-                x["observation"] = torch.Tensor(o/255.).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
+                x["observation"] = torch.Tensor(o/255.).to(device).unsqueeze(dim=0)  # 128x128 -> 1x128x128
                 x["memory"]["state"] = state_t
-                x["memory"]["mask"] = torch.tensor((d+1)%2, dtype=torch.float32).cuda()
+                x["memory"]["mask"] = torch.tensor((d+1)%2, dtype=torch.float32).to(device)
                 x["memory"]["action"] = a_t
                 # check terminal state
                 epoch_end = (i == (steps_per_epoch - 1))
@@ -97,7 +99,7 @@ def worker(worker_id,
     print(f"Worker with pid ({os.getpid()})  finished job")
 
 
-def tester(env, model, rnn_size, n = 5):
+def tester(env, model, rnn_size, device, n = 5):
     episode_reward = []
     for _ in range(n):
         # Wait for trainer to inform next job
@@ -111,9 +113,9 @@ def tester(env, model, rnn_size, n = 5):
                 o, r, d, _ = env.step(a_t.data.item())
                 total_r += r  # accumulate reward within one rollout.
                 # prepare inputs for next step
-                x["observation"] = torch.Tensor(o / 255.).cuda().unsqueeze(dim=0)  # 128x128 -> 1x128x128
+                x["observation"] = torch.Tensor(o / 255.).to(device).unsqueeze(dim=0)  # 128x128 -> 1x128x128
                 x["memory"]["state"] = state_t
-                x["memory"]["mask"] = torch.tensor((d + 1) % 2, dtype=torch.float32).cuda()
+                x["memory"]["mask"] = torch.tensor((d + 1) % 2, dtype=torch.float32).to(device)
                 x["memory"]["action"] = a_t
 
         episode_reward.append(total_r)

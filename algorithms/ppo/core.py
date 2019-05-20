@@ -215,23 +215,26 @@ class PPOBuffer:
     for calculating the advantages of state-action pairs.
     """
 
-    def __init__(self, obs_dim, size, num_envs, memory_size, gamma=0.99, lam=0.95):
-        self.obs_buf = torch.zeros((size, *obs_dim), dtype=torch.float32).cuda()
-        self.act_buf = torch.zeros(size, dtype=torch.long).cuda()
-        self.adv_buf = torch.zeros(size, dtype=torch.float32).cuda()
-        self.rew_buf = torch.zeros(size, dtype=torch.float32).cuda()
-        self.ret_buf = torch.zeros(size, dtype=torch.float32).cuda()
-        self.val_buf = torch.zeros(size, dtype=torch.float32).cuda()
-        self.logp_buf = torch.zeros(size, dtype=torch.float32).cuda()
-        self.h_buf = torch.zeros((size, memory_size), dtype=torch.float32).cuda()
-        self.mask_buf = torch.zeros(size, dtype=torch.float32).cuda()
+    def __init__(self, obs_dim, size, num_envs, memory_size, gamma=0.99, lam=0.95, device=torch.device('cpu')):
+        self.obs_buf = torch.zeros((size, *obs_dim), dtype=torch.float32).to(device)
+        self.act_buf = torch.zeros(size, dtype=torch.long).to(device)
+        self.adv_buf = torch.zeros(size, dtype=torch.float32).to(device)
+        self.rew_buf = torch.zeros(size, dtype=torch.float32).to(device)
+        self.ret_buf = torch.zeros(size, dtype=torch.float32).to(device)
+        self.val_buf = torch.zeros(size, dtype=torch.float32).to(device)
+        self.logp_buf = torch.zeros(size, dtype=torch.float32).to(device)
+        self.h_buf = torch.zeros((size, memory_size), dtype=torch.float32).to(device)
+        self.mask_buf = torch.zeros(size, dtype=torch.float32).to(device)
 
         # to control the indexing
-        self.ptr = torch.zeros(num_envs,dtype=torch.int).cuda()
-        self.path_start_idx = torch.zeros(num_envs,dtype=torch.int).cuda()
+        self.ptr = torch.zeros(num_envs,dtype=torch.int).to(device)
+        self.path_start_idx = torch.zeros(num_envs,dtype=torch.int).to(device)
 
         # constants
         self.gamma, self.lam, self.max_size, self.block_size = gamma, lam, size, size//num_envs
+
+        # device
+        self.device = device
 
     def share_memory(self):
         self.obs_buf.share_memory_()
@@ -281,7 +284,7 @@ class PPOBuffer:
         ptr = self.ptr[envid].item() + envid * self.block_size
         path_slice = slice(path_start_idx, ptr)
 
-        last_v = torch.Tensor([last_val]).cuda()
+        last_v = torch.Tensor([last_val], device=self.rew_buf.device)
         rews = torch.cat((self.rew_buf[path_slice], last_v), dim=0)
         vals = torch.cat((self.val_buf[path_slice], last_v), dim=0)
         # the next two lines implement GAE-Lambda advantage calculation
@@ -297,7 +300,7 @@ class PPOBuffer:
         :param mean_std:
         :return: None
         """
-        if mean_std == None:
+        if mean_std is None:
             mean = self.adv_buf.mean()
             std = self.adv_buf.std()
         else:
@@ -314,7 +317,7 @@ class PPOBuffer:
             assert self.ptr.sum().item() == self.max_size, f'expected size:{self.max_size}, actual:{self.ptr.sum().item()}' 
             self.ptr.copy_(torch.zeros_like(self.ptr))
             self.path_start_idx.copy_(torch.zeros_like(self.path_start_idx))
-        pre_a = torch.cat((torch.tensor([0],dtype=torch.long).cuda(), self.act_buf[:-1]),dim=0)
+        pre_a = torch.cat((torch.tensor([0],dtype=torch.long).to(self.device), self.act_buf[:-1]),dim=0)
         num_blocks = self.max_size//num_steps
         indice = torch.arange(self.max_size).view(-1,num_steps)
         batch_sampler = BatchSampler( SubsetRandomSampler(range(num_blocks)), batch_size//num_steps, drop_last=False)
@@ -333,5 +336,5 @@ class PPOBuffer:
         """
         flipped_x = torch.flip(x,dims=(0,)).cpu()
         out = scipy.signal.lfilter([1], [1, float(-discount)], flipped_x, axis=0)
-        t = torch.from_numpy(out).cuda()
+        t = torch.from_numpy(out).to(self.device)
         return torch.flip(t, dims=(0,))

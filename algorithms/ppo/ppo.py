@@ -4,6 +4,7 @@ import torch.nn.functional as F
 # Proximal Policy Optimization (by clipping),
 # with early stopping based on approximate KL
 
+
 class PPO():
     def __init__(self,
                  actor_critic,
@@ -30,9 +31,10 @@ class PPO():
         self.optimizer = torch.optim.Adam(actor_critic.parameters(), lr=lr, eps=eps)
 
     def update(self, rollouts):
+        device = rollouts.device
         for i in range(self.train_iters):
             batch_gen = rollouts.batch_generator(self.mini_batch_size)
-            kl_sum, ent_sum, pi_loss_sum, v_loss_sum = [torch.tensor(0.0).cuda() for _ in range(4)]
+            kl_sum, ent_sum, pi_loss_sum, v_loss_sum = [torch.tensor(0.0).to(device) for _ in range(4)]
 
             for batch in batch_gen:
                 obs, act, adv, ret, logp_old, state, mask, pre_action = batch

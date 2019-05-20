@@ -39,6 +39,7 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
     :param rank:
     :return:
     '''
+
     print(f"learner with pid ({os.getpid()})  starts job")
     logger = TB_logger("ppo_ai2thor",rank)
     agent = PPO(actor_critic = model, **ppo_params)

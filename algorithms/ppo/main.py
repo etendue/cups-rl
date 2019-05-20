@@ -16,29 +16,18 @@ def train_ai2thor(model, args, rank=0):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    torch.cuda.set_device(rank)
+    # torch.cuda.set_device(rank)
+    device = torch.cuda.device(rank)
     os.environ['DISPLAY'] = f':{rank}'
 
-    model = model.cuda()
+    model = model.to(device)
     model.share_memory()
 
     # Experience buffer
-    storage = PPOBuffer(model.obs_shape, args.steps, args.num_workers, args.state_size, args.gamma)
+    storage = PPOBuffer(model.obs_shape, args.steps, args.num_workers, args.state_size, args.gamma, device)
     storage.share_memory()
 
-    distributed = False
-    if args.world_size > 1:
-        distributed = True
-        # Initialize Process Group, distributed backend type
-        dist_backend = 'nccl'
-        # Url used to setup distributed training
-        dist_url = "tcp://127.0.0.1:23456"
-        print("Initialize Process Group... pid:", os.getpid())
-        dist.init_process_group(backend=dist_backend, init_method=dist_url, rank=rank, world_size=args.world_size)
-        # Make model DistributedDataParallel
-        model = DistributedDataParallel(model, device_ids=[rank], output_device=rank)
-        from torch.distributed.distributed_c10d import _default_pg
-        print(_default_pg)
+   
         
     #torch.multiprocessing.set_start_method('spawn')
     # start multiple processes
@@ -69,7 +58,20 @@ def train_ai2thor(model, args, rank=0):
                   "lr": args.lr,
                   "max_kl": args.max_kl
                   }
-
+    
+    distributed = False
+    if args.world_size > 1:
+        distributed = True
+        # Initialize Process Group, distributed backend type
+        dist_backend = 'nccl'
+        # Url used to setup distributed training
+        dist_url = "tcp://127.0.0.1:23456"
+        print("Initialize Process Group... pid:", os.getpid())
+        dist.init_process_group(backend=dist_backend, init_method=dist_url, rank=rank, world_size=args.world_size)
+        # Make model DistributedDataParallel
+        model = DistributedDataParallel(model, device_ids=[rank], output_device=rank)
+        from torch.distributed.distributed_c10d import _default_pg
+        print(_default_pg)
     learner(model, storage, train_params, ppo_params, ready_to_works, queue, exit_flag, rank, distributed)
 
     for p in processes:
@@ -84,7 +86,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--world-size', type=int, default=2)
     parser.add_argument('--steps', type=int, default=1024)
-    parser.add_argument('--num-workers', type=int, default=2)
+    parser.add_argument('--num-workers', type=int, default=1)
     parser.add_argument('--mini-batch-size', type=int, default=128)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--train-iters', type=int, default=10)
