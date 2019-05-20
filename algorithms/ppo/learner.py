@@ -43,6 +43,7 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
     print(f"learner with pid ({os.getpid()})  starts job")
     logger = TB_logger("ppo_ai2thor",rank)
     agent = PPO(actor_critic = model, **ppo_params)
+    device = rollout_storage.device
 
     # start workers for next epoch
     _ = [e.set() for e in ready_to_works]
@@ -56,6 +57,7 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
             rewards, steps = queue.get()
             rollout_ret.extend(rewards)
             rollout_steps.extend(steps)
+            print("get finish signal")
 
         # normalize advantage
         # if args.world_size > 1:
@@ -69,14 +71,14 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
 
         # train with batch
         model.train()
-        pi_loss, v_loss, kl, entropy = agent.update(rollout_storage)
+        pi_loss, v_loss, kl, entropy = agent.update(rollout_storage, distributed)
         model.eval()
-
         # start workers for next epoch
         if epoch == train_params["epochs"] -1:
             # set exit flag to 1, and notify workers to exit
             sync_flag.value = 1
 
+        print("inform worker for next work")
         _ = [e.set() for e in ready_to_works]
 
         # log statistics with TensorBoard
@@ -85,14 +87,15 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
         episode_count = len(rollout_ret)
 
         if distributed:
+            print("inside distributed")
             pi_loss = dist_mean(pi_loss)
             v_loss = dist_mean(v_loss)
             kl = dist_mean(kl)
             entropy = dist_mean(entropy)
-            ret_sum = dist_sum(torch.tensor(ret_sum).cuda())
-            steps_sum = dist_sum(torch.tensor(steps_sum).cuda())
-            episode_count = dist_sum(torch.tensor(episode_count).cuda())
-
+            ret_sum = dist_sum(torch.tensor(ret_sum).to(device))
+            steps_sum = dist_sum(torch.tensor(steps_sum).to(device))
+            episode_count = dist_sum(torch.tensor(episode_count).to(device))
+        print("outside distributed")
         # Log info about epoch
         global_steps = (epoch + 1) * train_params["steps"] * train_params["world_size"]
         fps = global_steps * train_params["world_size"] / (time.time() - start_time)

@@ -81,7 +81,7 @@ def worker(worker_id,
                     storage.finish_path(worker_id, 0)
                     episode_rewards.append(r_sum)
                     episode_steps.append(step_sum)
-                    x = reset(env, state_size)
+                    x = reset(env, state_size, device)
                     r_sum, step_sum = 0., 0
                 elif epoch_end: # early cut due to reach maximum steps in on epoch
                     _, _, _, last_val, _ = policy(x)

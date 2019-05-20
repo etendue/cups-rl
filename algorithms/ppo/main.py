@@ -17,17 +17,15 @@ def train_ai2thor(model, args, rank=0):
     np.random.seed(seed)
 
     # torch.cuda.set_device(rank)
-    device = torch.cuda.device(rank)
+    device = torch.device(f'cuda:{rank}')
     os.environ['DISPLAY'] = f':{rank}'
 
     model = model.to(device)
     model.share_memory()
 
     # Experience buffer
-    storage = PPOBuffer(model.obs_shape, args.steps, args.num_workers, args.state_size, args.gamma, device)
+    storage = PPOBuffer(model.obs_shape, args.steps, args.num_workers, args.state_size, args.gamma, device=device)
     storage.share_memory()
-
-   
         
     #torch.multiprocessing.set_start_method('spawn')
     # start multiple processes
@@ -70,8 +68,7 @@ def train_ai2thor(model, args, rank=0):
         dist.init_process_group(backend=dist_backend, init_method=dist_url, rank=rank, world_size=args.world_size)
         # Make model DistributedDataParallel
         model = DistributedDataParallel(model, device_ids=[rank], output_device=rank)
-        from torch.distributed.distributed_c10d import _default_pg
-        print(_default_pg)
+        
     learner(model, storage, train_params, ppo_params, ready_to_works, queue, exit_flag, rank, distributed)
 
     for p in processes:

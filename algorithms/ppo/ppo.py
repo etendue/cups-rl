@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 
 # Proximal Policy Optimization (by clipping),
 # with early stopping based on approximate KL
@@ -30,7 +31,7 @@ class PPO():
         self.max_kl = max_kl
         self.optimizer = torch.optim.Adam(actor_critic.parameters(), lr=lr, eps=eps)
 
-    def update(self, rollouts):
+    def update(self, rollouts, distributed=False):
         device = rollouts.device
         for i in range(self.train_iters):
             batch_gen = rollouts.batch_generator(self.mini_batch_size)
@@ -66,6 +67,9 @@ class PPO():
                     v_loss_sum += v_loss * batch_size
 
             kl_mean = kl_sum / rollouts.max_size
+            if distributed:
+                dist.all_reduce(kl_mean, dist.ReduceOp.SUM)
+                kl_mean = kl_mean/dist.get_world_size()
             if torch.abs(kl_mean) > self.max_kl:
                 print(f'Early stopping at iter ({i} /{self.train_iters}) due to reaching max kl. ({kl_mean:.4f})')
                 break

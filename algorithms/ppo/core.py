@@ -284,7 +284,7 @@ class PPOBuffer:
         ptr = self.ptr[envid].item() + envid * self.block_size
         path_slice = slice(path_start_idx, ptr)
 
-        last_v = torch.Tensor([last_val], device=self.rew_buf.device)
+        last_v = torch.Tensor([last_val]).to(self.device)
         rews = torch.cat((self.rew_buf[path_slice], last_v), dim=0)
         vals = torch.cat((self.val_buf[path_slice], last_v), dim=0)
         # the next two lines implement GAE-Lambda advantage calculation
