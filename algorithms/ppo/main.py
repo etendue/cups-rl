@@ -2,6 +2,8 @@ import os
 import torch
 import numpy as np
 from torch.multiprocessing import SimpleQueue, Process, Value, Event
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from algorithms.ppo.core import ActorCritic, PPOBuffer, count_vars
 from algorithms.ppo.worker import worker
 from algorithms.ppo.learner import learner
@@ -25,27 +27,28 @@ def train_ai2thor(model, args, rank=0):
     storage.share_memory()
 
     distributed = False
-    if args.world_size >1 :
+    if args.world_size > 1:
         distributed = True
         # Initialize Process Group, distributed backend type
-        import torch.distributed as dist
-        from torch.nn.parallel import DistributedDataParallel
         dist_backend = 'nccl'
         # Url used to setup distributed training
         dist_url = "tcp://127.0.0.1:23456"
-        print("Initialize Process Group...")
+        print("Initialize Process Group... pid:", os.getpid())
         dist.init_process_group(backend=dist_backend, init_method=dist_url, rank=rank, world_size=args.world_size)
         # Make model DistributedDataParallel
         model = DistributedDataParallel(model, device_ids=[rank], output_device=rank)
-
-        # start multiple processes
+        from torch.distributed.distributed_c10d import _default_pg
+        print(_default_pg)
+        
+    #torch.multiprocessing.set_start_method('spawn')
+    # start multiple processes
     ready_to_works = [Event() for _ in range(args.num_workers)]
     exit_flag = Value('i', 0)
     queue = SimpleQueue()
 
     processes = []
     task_config_file = "config_files/OneMug.json"
-    # start actors
+    # start workers
     for worker_id in range(args.num_workers):
         p = Process(target=worker, args=(worker_id, model, storage, ready_to_works[worker_id], queue, exit_flag,task_config_file))
         p.start()
@@ -79,7 +82,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--world-size', type=int, default=1)
+    parser.add_argument('--world-size', type=int, default=2)
     parser.add_argument('--steps', type=int, default=1024)
     parser.add_argument('--num-workers', type=int, default=2)
     parser.add_argument('--mini-batch-size', type=int, default=128)
@@ -97,7 +100,6 @@ if __name__ == '__main__':
     parser.add_argument('--max-kl', type=float, default=0.01)
 
     args = parser.parse_args()
-
     torch.multiprocessing.set_start_method('spawn')
 
     # get observation dimension
@@ -121,13 +123,13 @@ if __name__ == '__main__':
     if args.world_size > 1:
         processes = []
         for rank in range(args.world_size):
-            p = Process(target=train_ai2thor, args=(ac_model, args,rank))
+            p = Process(target=train_ai2thor, args=(ac_model, args, rank))
             p.start()
             processes.append(p)
 
         for p in processes:
-            print("process ", p.pid, " joined")
-        p.join()
+            p.join()
+            print("process ", p.pid, " joined") 
     else:
-        train_ai2thor(ac_model,args)
+        train_ai2thor(ac_model, args)
     print("main exits")
