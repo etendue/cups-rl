@@ -39,7 +39,7 @@ def worker(worker_id,
     :return:
     '''
 
-    print(f"Worker with pid ({os.getpid()}) starts ...")
+    print(f"Worker with Id:{worker_id} pid ({os.getpid()}) starts ...")
 
     steps_per_epoch = storage.block_size
     state_size = storage.h_buf.shape[1]
@@ -56,56 +56,62 @@ def worker(worker_id,
         for i in range(steps_per_epoch):
             with torch.no_grad():
                 a_t, logp_t, _, v_t, state_t = policy(x)
-                # interact with environment
-                o, r, d, _ = env.step(a_t.item())
-                r_sum += r  # accumulate reward within one rollout.
-                step_sum += 1
-                r_t = torch.tensor(r, dtype=torch.float32).to(device)
-                # save experience
-                storage.store(worker_id,
-                              x["observation"],
-                              a_t,
-                              r_t,
-                              v_t,
-                              logp_t,
-                              x["memory"]["state"],
-                              x["memory"]["mask"])
-                # prepare inputs for next step
-                x["observation"] = torch.Tensor(o/255.).to(device).unsqueeze(dim=0)  # 128x128 -> 1x128x128
-                x["memory"]["state"] = state_t
-                x["memory"]["mask"] = torch.tensor((d+1)%2, dtype=torch.float32).to(device)
-                x["memory"]["action"] = a_t
-                # check terminal state
-                epoch_end = (i == (steps_per_epoch - 1))
-                if d: # calculate the returns and GAE and reset environment
-                    storage.finish_path(worker_id, 0)
-                    episode_rewards.append(r_sum)
-                    episode_steps.append(step_sum)
-                    x = reset(env, state_size, device)
-                    r_sum, step_sum = 0., 0
-                elif epoch_end: # early cut due to reach maximum steps in on epoch
-                    _, _, _, last_val, _ = policy(x)
-                    storage.finish_path(worker_id,last_val)
-                    queue.put((episode_rewards,episode_steps))
-                    episode_rewards, episode_steps = [], []
-                    # x = reset(env, state_size)
-                    # r_sum, step_sum = 0., 0
+            # interact with environment
+            o, r, d, _ = env.step(a_t.item())
+            r_sum += r  # accumulate reward within one rollout.
+            step_sum += 1
+            r_t = torch.tensor(r, dtype=torch.float32).to(device)
+            # save experience
+            storage.store(worker_id,
+                            x["observation"],
+                            a_t,
+                            r_t,
+                            v_t,
+                            logp_t,
+                            x["memory"]["state"],
+                            x["memory"]["mask"])
+            # prepare inputs for next step
+            x["observation"] = torch.Tensor(o/255.).to(device).unsqueeze(dim=0)  # 128x128 -> 1x128x128
+            x["memory"]["state"] = state_t
+            x["memory"]["mask"] = torch.tensor((d+1)%2, dtype=torch.float32).to(device)
+            x["memory"]["action"] = a_t
+            # check terminal state
+            if d: # calculate the returns and GAE and reset environment
+                storage.finish_path(worker_id, 0)
+                print(f"Worker:{worker_id} {device} pid:{os.getpid()} finishes goal at steps :{i}")
+                episode_rewards.append(r_sum)
+                episode_steps.append(step_sum)
+                x = reset(env, state_size, device)
+                r_sum, step_sum = 0., 0
+        # env does not reaches end
+        if not d:
+            _, _, _, last_val, _ = policy(x)
+            storage.finish_path(worker_id,last_val)
+        print(f"Worker:{worker_id} {device} pid:{os.getpid()} begins to notify Learner Episode done")
+        queue.put((episode_rewards,episode_steps, worker_id))
+        print(f"Worker:{worker_id} waits for next episode")
+        episode_rewards, episode_steps = [], []
+        # x = reset(env, state_size)
+        # r_sum, step_sum = 0., 0
         # Wait for next job
         ready_to_work.clear()
         ready_to_work.wait()
+        print(f"Worker:{worker_id} {device} pid:{os.getpid()} starts new episode")
 
     env.close()
 
     print(f"Worker with pid ({os.getpid()})  finished job")
 
 
-def tester(env, model, rnn_size, device, n = 5):
+def tester(model, device, n=5, task_config_file="config_files/OneMugTest.json"):
     episode_reward = []
+    rnn_size = 128
+    env = AI2ThorEnv(config_file=task_config_file)
     for _ in range(n):
         # Wait for trainer to inform next job
         total_r = 0.
         d = False
-        x = reset(env, rnn_size)
+        x = reset(env, rnn_size, device)
         while not d:
             with torch.no_grad():
                 a_t, _, _, _, state_t = model(x)

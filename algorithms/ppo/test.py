@@ -5,26 +5,25 @@ from algorithms.ppo.core import ActorCritic
 from  gym_ai2thor.envs.ai2thor_env import AI2ThorEnv
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model-path', type=str, default=None)
-    args = parser.parse_args()
-    if args.model_path is None:
-        print("Please specify model path for test")
-        sys.exit() 
 
-    env = AI2ThorEnv(config_file="config_files/OneMugTest.json")
+    gpu_id = 0
+    device = torch.cuda(f'cuda:{gpu_id}')
+    env = AI2ThorEnv()
     obs_dim = env.observation_space.shape
     # Share information about action space with policy architecture
     rnn_size= 128
     ac_kwargs = dict()
     ac_kwargs['action_space'] = env.action_space
     ac_kwargs['state_size'] = rnn_size
-    # Construct Model
-    ac_model = ActorCritic(obs_shape=obs_dim, **ac_kwargs).cuda()
-    state_dict = torch.load(args.model_path)
-    # load params
-    ac_model.load_state_dict(state_dict)
-    tester(env,ac_model,rnn_size)
     env.close()
+    # Construct Model
+    ac_model = ActorCritic(obs_shape=obs_dim, **ac_kwargs).to(device)
+
+    for name in sys.argv[1:]:
+        print("test with model:",name)
+        state_dict = torch.load(name)
+        # load params
+        ac_model.load_state_dict(state_dict)
+        tester(ac_model,device)
+    
     print(f"Tester finished job")

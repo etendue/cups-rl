@@ -25,6 +25,10 @@ class TB_logger:
     def add_scalar(self, name, val, steps):
         if self.rank == 0:
             self.writer.add_scalar(name, val, steps)
+    
+    def log_info(self, info):
+        if self.rank ==0:
+            print(info)
 
 
 def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, queue, sync_flag, rank=0, distributed=False):
@@ -53,32 +57,33 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
         rollout_ret = []
         rollout_steps = []
         # wait until all workers finish a epoch
-        for _ in range(train_params["num_workers"]):
-            rewards, steps = queue.get()
+        for i in range(train_params["num_workers"]):
+            rewards, steps, id = queue.get()
+            print(f'Leaner recieve worker:{id} done signal and reaches {i}th wokers')
             rollout_ret.extend(rewards)
             rollout_steps.extend(steps)
-            print("get finish signal")
 
         # normalize advantage
-        # if args.world_size > 1:
-        #     mean = exp_buf.adv_buf.mean()
-        #     var = exp_buf.adv_buf.var()
+        # if distributed:
+        #     mean = rollout_storage.adv_buf.mean()
+        #     var = rollout_storage.adv_buf.var()
         #     mean = dist_mean(mean)
         #     var = dist_mean(var)
-        #     exp_buf.normalize_adv(mean_std=(mean, torch.sqrt(var)))
+        #     rollout_storage.normalize_adv(mean_std=(mean, torch.sqrt(var)))
         # else:
-        #     exp_buf.normalize_adv()
+        #     rollout_storage.normalize_adv()
 
         # train with batch
+        print("Start training")
         model.train()
         pi_loss, v_loss, kl, entropy = agent.update(rollout_storage, distributed)
+        v_mean = rollout_storage.val_buf.mean()
         model.eval()
+        print("Finishes training")
         # start workers for next epoch
         if epoch == train_params["epochs"] -1:
             # set exit flag to 1, and notify workers to exit
             sync_flag.value = 1
-
-        print("inform worker for next work")
         _ = [e.set() for e in ready_to_works]
 
         # log statistics with TensorBoard
@@ -87,32 +92,33 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
         episode_count = len(rollout_ret)
 
         if distributed:
-            print("inside distributed")
             pi_loss = dist_mean(pi_loss)
             v_loss = dist_mean(v_loss)
             kl = dist_mean(kl)
             entropy = dist_mean(entropy)
+            v_mean = dist_mean(v_mean)
             ret_sum = dist_sum(torch.tensor(ret_sum).to(device))
             steps_sum = dist_sum(torch.tensor(steps_sum).to(device))
             episode_count = dist_sum(torch.tensor(episode_count).to(device))
-        print("outside distributed")
         # Log info about epoch
+        print("finish statistics")
         global_steps = (epoch + 1) * train_params["steps"] * train_params["world_size"]
         fps = global_steps * train_params["world_size"] / (time.time() - start_time)
-        print(f"Epoch [{epoch}] avg. FPS:[{fps:.2f}]")
+        logger.log_info(f"Epoch [{epoch}] avg. FPS:[{fps:.2f}]")
 
         logger.add_scalar("KL", kl, global_steps)
         logger.add_scalar("Entropy", entropy, global_steps)
         logger.add_scalar("p_loss", pi_loss, global_steps)
         logger.add_scalar("v_loss", v_loss, global_steps)
+        logger.add_scalar("v_mean", v_mean, global_steps)
 
         if episode_count > 0:
             ret_per_1000 = (ret_sum / steps_sum) * 1000
             logger.add_scalar("Return1000", ret_per_1000, global_steps)
-            print(f"Epoch [{epoch}] Steps {global_steps}: "
+            logger.log_info(f"Epoch [{epoch}] Steps {global_steps}: "
                   f"return:({ret_per_1000:.1f})")
         else:
-            print(f"Epoch [{epoch}] Steps {global_steps}: "
+            logger.log_info(f"Epoch [{epoch}] Steps {global_steps}: "
                   f"Goal is not reached in this epoch")
 
         if (epoch + 1) % 20 == 0 and rank == 0:
