@@ -2,6 +2,7 @@
 Different task implementations that can be defined inside an ai2thor environment
 """
 
+from collections import Counter
 from gym_ai2thor.utils import InvalidTaskParams
 
 
@@ -79,3 +80,48 @@ class PickUpTask(BaseTask):
     def reset(self):
         self.prev_inventory = []
         self.step_num = 0
+
+
+class PickUpTaskWithGoal(PickUpTask):
+    """
+    This task consists of picking up a target object. Rewards are only collected if the right
+    object was added to the inventory with the action PickUp (See gym_ai2thor.envs.ai2thor_env for
+    details). Because the agent can only carry 1 object at a time in its inventory, to receive
+    a lot of reward one must learn to put objects down. Optimal behaviour will lead to the agent
+    spamming PickupObject and PutObject near a receptacle. target_objects is a dict which contains
+    the target objects which the agent gets reward for picking up and the amount of reward was the
+    value
+    """
+    def __init__(self, **kwargs):
+        super().__init__(kwargs)
+        self.goal = kwargs['task'].get('goal', float('inf'))
+        self.picked_objects = 0
+
+    def transition_reward(self, state):
+        reward, done = self.movement_reward, False
+        curr_inventory = state.metadata['inventoryObjects']
+        object_picked_up = not self.prev_inventory and curr_inventory and \
+                           curr_inventory[0]['objectType'] in self.target_objects
+
+        if object_picked_up:
+            # One of the Target objects has been picked up. Add reward from the specific object
+            reward += self.target_objects.get(curr_inventory[0]['objectType'], 0)
+            self.picked_objects += 1
+            if self.picked_objects >= self.goal:
+                print('{} reward collected! and goal reached at step: {}'.format(reward,self.step_num))
+                done = True
+            else:
+                print('{} reward collected!'.format(reward))
+
+        if self.max_episode_length and self.step_num >= self.max_episode_length:
+            print('Reached maximum episode length: {}'.format(self.step_num))
+            done = True
+
+        self.prev_inventory = state.metadata['inventoryObjects']
+        return reward, done
+
+    def reset(self):
+        super().reset()
+        self.picked_objects = 0
+
+

@@ -8,7 +8,7 @@ def reset(env, state_size, device):
     o = env.reset()
     mask_t = torch.tensor(0., dtype=torch.float32).to(device)
     prev_a = torch.tensor(0, dtype=torch.long).to(device)
-    obs_t = torch.Tensor(o / 255.).to(device).unsqueeze(dim=0)  # -> 1x128x128
+    obs_t = torch.Tensor(o / 255.).to(device)
     state_t = torch.zeros(state_size, dtype=torch.float32).to(device)
     x = {"observation": obs_t,
          "memory": {
@@ -119,7 +119,7 @@ def tester(model, device, n=5, task_config_file="config_files/OneMugTest.json"):
                 o, r, d, _ = env.step(a_t.data.item())
                 total_r += r  # accumulate reward within one rollout.
                 # prepare inputs for next step
-                x["observation"] = torch.Tensor(o / 255.).to(device).unsqueeze(dim=0)  # 128x128 -> 1x128x128
+                x["observation"] = torch.Tensor(o / 255.).to(device)
                 x["memory"]["state"] = state_t
                 x["memory"]["mask"] = torch.tensor((d + 1) % 2, dtype=torch.float32).to(device)
                 x["memory"]["action"] = a_t
