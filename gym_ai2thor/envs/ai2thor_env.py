@@ -2,17 +2,20 @@
 Base class implementation for ai2thor environments wrapper, which adds an openAI gym interface for
 inheriting the predefined methods and can be extended for particular tasks.
 """
+
+import os
+
 import ai2thor.controller
 import numpy as np
 from skimage import transform
-from copy import deepcopy
+from collections import defaultdict
 
 import gym
 from gym import error, spaces
 from gym.utils import seeding
 from gym_ai2thor.image_processing import rgb2gray
 from gym_ai2thor.utils import read_config
-from gym_ai2thor.tasks import TaskFactory
+import gym_ai2thor.tasks
 
 ALL_POSSIBLE_ACTIONS = [
     'MoveAhead',
@@ -27,7 +30,12 @@ ALL_POSSIBLE_ACTIONS = [
     'CloseObject',
     'PickupObject',
     'PutObject'
-    # Teleport and TeleportFull but these shouldn't be allowable actions for an agent
+    # Non-available actions within this wrapper:
+    # 'Rotate' is also possible when continuous_movement == True but we don't list it here
+    # 'Teleport' and 'TeleportFull' but these shouldn't be allowable actions for an agent
+    # These actions below are from ai2thor 1.0 but they're hard to discretize so they're not usable
+    # 'DropHandObject', 'ThrowObject', 'ToggleObjectOn', 'ToggleObjectOff', 'MoveHandAhead',
+    # 'MoveHandBack', 'MoveHandLeft', 'MoveHandRight', 'MoveHandUp', 'MoveHandDown', 'RotateHand'
 ]
 
 
@@ -67,6 +75,12 @@ class AI2ThorEnv(gym.Env):
             self.action_names = tuple([action_name for action_name in self.action_names if 'Pickup'
                                        not in action_name and 'Put' not in action_name])
         self.action_space = spaces.Discrete(len(self.action_names))
+        # rotation settings
+        self.continuous_movement = self.config.get('continuous_movement', False)
+        if self.continuous_movement:
+            self.absolute_rotation = 0.0
+            self.rotation_amount = 10.0
+
         # Image settings
         self.event = None
         channels = 1 if self.config['grayscale'] else 3
@@ -74,10 +88,34 @@ class AI2ThorEnv(gym.Env):
                                             shape=(channels, self.config['resolution'][0],
                                                    self.config['resolution'][1]),
                                             dtype=np.uint8)
+        # ai2thor initialise function settings
+        self.metadata_last_object_attributes = ['lastObjectPut', 'lastObjectPutReceptacle',
+                                                'lastObjectPickedUp', 'lastObjectOpened',
+                                                'lastObjectClosed']
+        self.cameraY = self.config.get('cameraY', 0.0)
+        self.gridSize = self.config.get('gridSize', 0.1)
+        # Rendering options. Set segmentation and bounding box options off as default
+        self.render_options = defaultdict(lambda: False)
+        if 'render_options' in self.config:
+            for option, value in self.config['render_options'].items():
+                self.render_options[option] = value
         # Create task from config
-        self.task = TaskFactory.create_task(self.config)
+        try:
+            self.task = getattr(gym_ai2thor.tasks, self.config['task']['task_name'])(**self.config)
+        except Exception as e:
+            raise ValueError('Error occurred while creating task. Exception: {}'.format(e))
         # Start ai2thor
         self.controller = ai2thor.controller.Controller()
+        if self.config.get('build_file_name'):
+            # file must be in gym_ai2thor/build_files
+            self.build_file_path = os.path.abspath(os.path.join(__file__, '../../build_files',
+                                                                self.config['build_file_name']))
+            print('Build file path at: {}'.format(self.build_file_path))
+            if not os.path.exists(self.build_file_path):
+                raise ValueError('Unity build file at:\n{}\n does not exist'.format(
+                    self.build_file_path))
+            self.controller.local_executable_path = self.build_file_path
+
         self.controller.start()
 
     def step(self, action, verbose=True):
@@ -86,66 +124,82 @@ class AI2ThorEnv(gym.Env):
                                       '0 and {}!'.format(self.action_space.n))
         action_str = self.action_names[action]
         visible_objects = [obj for obj in self.event.metadata['objects'] if obj['visible']]
+        for attribute in self.metadata_last_object_attributes:
+            self.event.metadata[attribute] = None
 
+        # if/else statements below for dealing with up to 13 actions
         if action_str.endswith('Object'):  # All interactions end with 'Object'
             # Interaction actions
             interaction_obj, distance = None, float('inf')
             inventory_before = self.event.metadata['inventoryObjects'][0]['objectType'] \
                 if self.event.metadata['inventoryObjects'] else []
-            if action_str == 'PutObject':
+            if action_str.startswith('Put'):
                 closest_receptacle = None
-                for obj in visible_objects:
-                    # look for closest receptacle to put object from inventory
-                    if obj['receptacle'] and obj['distance'] < distance \
-                        and obj['objectType'] in self.objects['receptacles'] \
-                            and len(obj['receptacleObjectIds']) < obj['receptacleCount']:
-                        closest_receptacle = obj
-                        distance = closest_receptacle['distance']
-                if self.event.metadata['inventoryObjects'] and closest_receptacle:
-                    interaction_obj = closest_receptacle
-                    self.event = self.controller.step(
-                            dict(action=action_str,
-                                 objectId=self.event.metadata['inventoryObjects'][0]['objectId'],
-                                 receptacleObjectId=interaction_obj['objectId']))
-            elif action_str == 'PickupObject':
+                if self.event.metadata['inventoryObjects']:
+                    for obj in visible_objects:
+                        # look for closest receptacle to put object from inventory
+                        closest_receptacle_to_put_object_in = obj['receptacle'] and \
+                                                              obj['distance'] < distance \
+                                        and obj['objectType'] in self.objects['receptacles']
+                        if closest_receptacle_to_put_object_in:
+                            closest_receptacle = obj
+                            distance = closest_receptacle['distance']
+                    if closest_receptacle:
+                        interaction_obj = closest_receptacle
+                        object_to_put = self.event.metadata['inventoryObjects'][0]
+                        self.event = self.controller.step(
+                                dict(action=action_str,
+                                     objectId=object_to_put['objectId'],
+                                     receptacleObjectId=interaction_obj['objectId']))
+                        self.event.metadata['lastObjectPut'] = object_to_put
+                        self.event.metadata['lastObjectPutReceptacle'] = interaction_obj
+            elif action_str.startswith('Pickup'):
                 closest_pickupable = None
                 for obj in visible_objects:
                     # look for closest object to pick up
-                    if obj['pickupable'] and obj['distance'] < distance and \
-                            obj['objectType'] in self.objects['pickupables']:
+                    closest_object_to_pick_up = obj['pickupable'] and \
+                                                obj['distance'] < distance and \
+                                obj['objectType'] in self.objects['pickupables']
+                    if closest_object_to_pick_up:
                         closest_pickupable = obj
                 if closest_pickupable and not self.event.metadata['inventoryObjects']:
                     interaction_obj = closest_pickupable
                     self.event = self.controller.step(
                         dict(action=action_str, objectId=interaction_obj['objectId']))
-            elif action_str == 'OpenObject':
+                    self.event.metadata['lastObjectPickedUp'] = interaction_obj
+            elif action_str.startswith('Open'):
                 closest_openable = None
                 for obj in visible_objects:
                     # look for closest closed receptacle to open it
-                    if obj['openable'] and obj['distance'] < distance and not obj['isopen'] and \
-                            obj['objectType'] in self.objects['openables']:
+                    is_closest_closed_receptacle = obj['openable'] and \
+                            obj['distance'] < distance and not obj['isopen'] and \
+                            obj['objectType'] in self.objects['openables']
+                    if is_closest_closed_receptacle:
                         closest_openable = obj
                         distance = closest_openable['distance']
-                    if closest_openable:
-                        interaction_obj = closest_openable
-                        self.event = self.controller.step(
-                            dict(action=action_str,
-                                 objectId=interaction_obj['objectId']))
-            elif action_str == 'CloseObject':
+                if closest_openable:
+                    interaction_obj = closest_openable
+                    self.event = self.controller.step(
+                        dict(action=action_str, objectId=interaction_obj['objectId']))
+                    self.event.metadata['lastObjectOpened'] = interaction_obj
+            elif action_str.startswith('Close'):
                 closest_openable = None
                 for obj in visible_objects:
                     # look for closest opened receptacle to close it
-                    if obj['openable'] and obj['distance'] < distance and obj['isopen'] and \
-                            obj['objectType'] in self.objects['openables']:
+                    is_closest_open_receptacle = obj['openable'] and obj['distance'] < distance \
+                                                 and obj['isopen'] and \
+                                                 obj['objectType'] in self.objects['openables']
+                    if is_closest_open_receptacle:
                         closest_openable = obj
                         distance = closest_openable['distance']
-                    if closest_openable:
-                        interaction_obj = closest_openable
-                        self.event = self.controller.step(
-                            dict(action=action_str,
-                                 objectId=interaction_obj['objectId']))
+                if closest_openable:
+                    interaction_obj = closest_openable
+                    self.event = self.controller.step(
+                        dict(action=action_str, objectId=interaction_obj['objectId']))
+                    self.event.metadata['lastObjectClosed'] = interaction_obj
             else:
                 raise error.InvalidAction('Invalid interaction {}'.format(action_str))
+            # print what object was interacted with and state of inventory
             if interaction_obj and verbose:
                 inventory_after = self.event.metadata['inventoryObjects'][0]['objectType'] \
                     if self.event.metadata['inventoryObjects'] else []
@@ -156,9 +210,23 @@ class AI2ThorEnv(gym.Env):
                     inventory_changed_str = ''
                 print('{}: {}. {}'.format(
                     action_str, interaction_obj['objectType'], inventory_changed_str))
-        else:
-            # Move, Look or Rotate actions
+        elif action_str.startswith('Rotate'):
+            if self.continuous_movement:
+                # Rotate action
+                if action_str.endswith('Left'):
+                    self.absolute_rotation -= self.rotation_amount
+                elif action_str.endswith('Right'):
+                    self.absolute_rotation += self.rotation_amount
+                self.event = self.controller.step(
+                    dict(action='Rotate', rotation=self.absolute_rotation))
+            else:
+                # Do normal RotateLeft/Right command in discrete mode (i.e. 3D GridWorld)
+                self.event = self.controller.step(dict(action=action_str))
+        elif action_str.startswith('Move') or action_str.startswith('Look'):
+            # Move and Look actions
             self.event = self.controller.step(dict(action=action_str))
+        else:
+            raise NotImplementedError('action_str: {} is not implemented'.format(action_str))
 
         self.task.step_num += 1
         state_image = self.preprocess(self.event.frame)
@@ -171,18 +239,23 @@ class AI2ThorEnv(gym.Env):
         """
         Compute image operations to generate state representation
         """
+        # TODO: replace scikit image with opencv
         img = transform.resize(img, self.config['resolution'], mode='reflect')
         img = img.astype(np.float32)
         if self.observation_space.shape[0] == 1:
-            img = rgb2gray(img)  # todo cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            img = rgb2gray(img)
+        img = np.moveaxis(img, 2, 0)
         return img
 
     def reset(self):
         print('Resetting environment and starting new episode')
         self.controller.reset(self.scene_id)
-        self.event = self.controller.step(dict(action='Initialize', gridSize=0.25,
-                                               renderDepthImage=True, renderClassImage=True,
-                                               renderObjectImage=True))
+        self.event = self.controller.step(dict(action='Initialize', gridSize=self.gridSize,
+                                               cameraY=self.cameraY,
+                                               renderDepthImage=self.render_options['depth'],
+                                               renderClassImage=self.render_options['class'],
+                                               renderObjectImage=self.render_options['object'],
+                                               continuous=self.continuous_movement))
         self.task.reset()
         state = self.preprocess(self.event.frame)
         return state
