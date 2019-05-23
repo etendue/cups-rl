@@ -1,7 +1,7 @@
 import os
 import torch
 import numpy as np
-from torch.multiprocessing import SimpleQueue, Process, Value, Event
+from torch.multiprocessing import SimpleQueue, Process, Value, Event, Barrier
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from algorithms.ppo.core import ActorCritic, PPOBuffer, count_vars
@@ -10,7 +10,7 @@ from algorithms.ppo.learner import learner
 from gym_ai2thor.envs.ai2thor_env import AI2ThorEnv
 
 
-def train_ai2thor(model, args, rank=0):
+def train_ai2thor(model, args, rank=0, b=None):
 
     seed = args.seed + 10000 *rank
     torch.manual_seed(seed)
@@ -37,7 +37,7 @@ def train_ai2thor(model, args, rank=0):
     task_config_file = "config_files/OneMug.json"
     # start workers
     for worker_id in range(args.num_workers):
-        p = Process(target=worker, args=(worker_id, model, storage, ready_to_works[worker_id], queue, exit_flag,task_config_file))
+        p = Process(target=worker, args=(worker_id, model, storage, ready_to_works[worker_id], queue, exit_flag, task_config_file))
         p.start()
         processes.append(p)
 
@@ -69,7 +69,7 @@ def train_ai2thor(model, args, rank=0):
         # Make model DistributedDataParallel
         model = DistributedDataParallel(model, device_ids=[rank], output_device=rank)
         
-    learner(model, storage, train_params, ppo_params, ready_to_works, queue, exit_flag, rank, distributed)
+    learner(model, storage, train_params, ppo_params, ready_to_works, queue, exit_flag, rank, distributed, b)
 
     for p in processes:
         print("process ", p.pid, " joined")
@@ -121,8 +121,9 @@ if __name__ == '__main__':
 
     if args.world_size > 1:
         processes = []
+        b = Barrier(args.world_size)
         for rank in range(args.world_size):
-            p = Process(target=train_ai2thor, args=(ac_model, args, rank))
+            p = Process(target=train_ai2thor, args=(ac_model, args, rank, b))
             p.start()
             processes.append(p)
 

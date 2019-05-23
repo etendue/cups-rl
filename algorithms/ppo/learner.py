@@ -30,8 +30,7 @@ class TB_logger:
         if self.rank ==0:
             print(info)
 
-
-def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, queue, sync_flag, rank=0, distributed=False):
+def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, queue, sync_flag, rank=0, distributed=False, b=None):
     '''
     learner use ppo algorithm to train model with experience from storage
     :param model:
@@ -48,21 +47,32 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
     logger = TB_logger("ppo_ai2thor",rank)
     agent = PPO(actor_critic = model, **ppo_params)
     device = rollout_storage.device
-
+    if distributed:
+        world_size = dist.get_world_size()
+    else:
+        world_size = 1
+    
+    epochs = train_params["epochs"]
+    min_clip_param = 0.001
+    min_kl = 0.001
     # start workers for next epoch
     _ = [e.set() for e in ready_to_works]
     # Training policy
     start_time = time.time()
-    for epoch in range(train_params["epochs"]):
+    for epoch in range(epochs):
+        agent.clip_param = (ppo_params['clip_param'] - min_clip_param)*(epochs -epoch)/epochs + min_clip_param
+        agent.max_kl = (ppo_params['max_kl'] -  min_kl)*(epochs-epoch)/epochs + min_kl
         rollout_ret = []
         rollout_steps = []
         # wait until all workers finish a epoch
         for i in range(train_params["num_workers"]):
             rewards, steps, id = queue.get()
-            print(f'Leaner recieve worker:{id} done signal and reaches {i}th wokers')
+            print(f'Leaner rank:{rank} recieve worker:{id} done signal and reaches {i}th wokers')
             rollout_ret.extend(rewards)
             rollout_steps.extend(steps)
-
+        print(f'Learner rank:{rank} wait')
+        b.wait()
+        print("Start training")
         # normalize advantage
         # if distributed:
         #     mean = rollout_storage.adv_buf.mean()
@@ -74,7 +84,6 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
         #     rollout_storage.normalize_adv()
 
         # train with batch
-        print("Start training")
         model.train()
         pi_loss, v_loss, kl, entropy = agent.update(rollout_storage, distributed)
         v_mean = rollout_storage.val_buf.mean()
@@ -101,7 +110,6 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
             steps_sum = dist_sum(torch.tensor(steps_sum).to(device))
             episode_count = dist_sum(torch.tensor(episode_count).to(device))
         # Log info about epoch
-        print("finish statistics")
         global_steps = (epoch + 1) * train_params["steps"] * train_params["world_size"]
         fps = global_steps * train_params["world_size"] / (time.time() - start_time)
         logger.log_info(f"Epoch [{epoch}] avg. FPS:[{fps:.2f}]")
@@ -111,20 +119,25 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
         logger.add_scalar("p_loss", pi_loss, global_steps)
         logger.add_scalar("v_loss", v_loss, global_steps)
         logger.add_scalar("v_mean", v_mean, global_steps)
-
+        
+        # print(agent.clip_param,agent.max_kl)
+        logger.add_scalar("clip_ration", agent.clip_param, global_steps)
+        logger.add_scalar("max_kl", agent.max_kl, global_steps)
+        
         if episode_count > 0:
             ret_per_1000 = (ret_sum / steps_sum) * 1000
             logger.add_scalar("Return1000", ret_per_1000, global_steps)
             logger.log_info(f"Epoch [{epoch}] Steps {global_steps}: "
-                  f"return:({ret_per_1000:.1f})")
+                  f"return:({ret_per_1000:.1f}), sum:{ret_sum}, step_sum:{steps_sum}")
         else:
             logger.log_info(f"Epoch [{epoch}] Steps {global_steps}: "
                   f"Goal is not reached in this epoch")
-
+        
         if (epoch + 1) % 20 == 0 and rank == 0:
             if distributed:
                 torch.save(model.module.state_dict(), f'model{epoch+1}.pt')
             else:
                 torch.save(model.state_dict(), f'model{epoch+1}.pt')
-
+        print("finish statistics")
+        
     print(f"learner with pid ({os.getpid()})  finished job")

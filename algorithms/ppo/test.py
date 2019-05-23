@@ -7,7 +7,7 @@ from  gym_ai2thor.envs.ai2thor_env import AI2ThorEnv
 if __name__ == '__main__':
 
     gpu_id = 0
-    device = torch.cuda(f'cuda:{gpu_id}')
+    device = torch.device(f'cuda:{gpu_id}')
     env = AI2ThorEnv()
     obs_dim = env.observation_space.shape
     # Share information about action space with policy architecture

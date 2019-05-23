@@ -78,7 +78,7 @@ def worker(worker_id,
             # check terminal state
             if d: # calculate the returns and GAE and reset environment
                 storage.finish_path(worker_id, 0)
-                print(f"Worker:{worker_id} {device} pid:{os.getpid()} finishes goal at steps :{i}")
+                # print(f"Worker:{worker_id} {device} pid:{os.getpid()} finishes goal at steps :{i}")
                 episode_rewards.append(r_sum)
                 episode_steps.append(step_sum)
                 x = reset(env, state_size, device)
@@ -87,16 +87,16 @@ def worker(worker_id,
         if not d:
             _, _, _, last_val, _ = policy(x)
             storage.finish_path(worker_id,last_val)
-        print(f"Worker:{worker_id} {device} pid:{os.getpid()} begins to notify Learner Episode done")
+        # print(f"Worker:{worker_id} {device} pid:{os.getpid()} begins to notify Learner Episode done")
         queue.put((episode_rewards,episode_steps, worker_id))
-        print(f"Worker:{worker_id} waits for next episode")
+        # print(f"Worker:{worker_id} waits for next episode")
         episode_rewards, episode_steps = [], []
         # x = reset(env, state_size)
         # r_sum, step_sum = 0., 0
         # Wait for next job
         ready_to_work.clear()
         ready_to_work.wait()
-        print(f"Worker:{worker_id} {device} pid:{os.getpid()} starts new episode")
+        # print(f"Worker:{worker_id} {device} pid:{os.getpid()} starts new episode")
 
     env.close()
 
