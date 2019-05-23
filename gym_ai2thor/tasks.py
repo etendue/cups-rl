@@ -2,7 +2,6 @@
 Different task implementations that can be defined inside an ai2thor environment
 """
 
-from collections import Counter
 from gym_ai2thor.utils import InvalidTaskParams
 
 
@@ -93,7 +92,7 @@ class PickUpTaskWithGoal(PickUpTask):
     value
     """
     def __init__(self, **kwargs):
-        super().__init__(kwargs)
+        super().__init__(**kwargs)
         self.goal = kwargs['task'].get('goal', float('inf'))
         self.picked_objects = 0
 

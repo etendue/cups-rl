@@ -71,7 +71,7 @@ def worker(worker_id,
                             x["memory"]["state"],
                             x["memory"]["mask"])
             # prepare inputs for next step
-            x["observation"] = torch.Tensor(o/255.).to(device).unsqueeze(dim=0)  # 128x128 -> 1x128x128
+            x["observation"] = torch.Tensor(o/255.).to(device) # 128x128 -> 1x128x128
             x["memory"]["state"] = state_t
             x["memory"]["mask"] = torch.tensor((d+1)%2, dtype=torch.float32).to(device)
             x["memory"]["action"] = a_t
@@ -99,11 +99,10 @@ def worker(worker_id,
         # print(f"Worker:{worker_id} {device} pid:{os.getpid()} starts new episode")
 
     env.close()
-
     print(f"Worker with pid ({os.getpid()})  finished job")
 
 
-def tester(model, device, n=5, task_config_file="config_files/OneMugTest.json"):
+def tester(model, device, n=5, task_config_file="config_files/config_example.json"):
     episode_reward = []
     rnn_size = 128
     env = AI2ThorEnv(config_file=task_config_file)
@@ -127,4 +126,5 @@ def tester(model, device, n=5, task_config_file="config_files/OneMugTest.json"):
         episode_reward.append(total_r)
         print("Episode reward:", total_r)
 
+    env.close()
     print(f"Average eposide reward ({np.mean(episode_reward)})")

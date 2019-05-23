@@ -20,11 +20,11 @@
     "gridSize": 0.1,
     "continuous_movement": false,
     "build_file_name": false,
+    "movement_reward":-0.001,
+    "max_episode_length":1024,
     "task": {
         "task_name": "PickUpTaskWithGoal",
         "target_objects": {"Mug": 1},
-        "goal": 5,
-        "movement_reward":-0.001,
-        "max_episode_length":1024
+        "goal": 5
     }
 }

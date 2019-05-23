@@ -34,7 +34,7 @@ def train_ai2thor(model, args, rank=0, b=None):
     queue = SimpleQueue()
 
     processes = []
-    task_config_file = "config_files/OneMug.json"
+    task_config_file = "config_files/multiMugTaskTrain.json"
     # start workers
     for worker_id in range(args.num_workers):
         p = Process(target=worker, args=(worker_id, model, storage, ready_to_works[worker_id], queue, exit_flag, task_config_file))
@@ -102,7 +102,7 @@ if __name__ == '__main__':
     torch.multiprocessing.set_start_method('spawn')
 
     # get observation dimension
-    env = AI2ThorEnv(config_file="config_files/OneMug.json")
+    env = AI2ThorEnv(config_file="config_files/multiMugTaskTrain.json")
     obs_dim = env.observation_space.shape
     # Share information about action space with policy architecture
     ac_kwargs = dict()

@@ -70,8 +70,10 @@ def learner(model, rollout_storage, train_params, ppo_params, ready_to_works, qu
             print(f'Leaner rank:{rank} recieve worker:{id} done signal and reaches {i}th wokers')
             rollout_ret.extend(rewards)
             rollout_steps.extend(steps)
-        print(f'Learner rank:{rank} wait')
-        b.wait()
+
+        if b:
+            print(f'Learner rank:{rank} wait')
+            b.wait()
         print("Start training")
         # normalize advantage
         # if distributed:

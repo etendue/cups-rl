@@ -24,6 +24,6 @@ if __name__ == '__main__':
         state_dict = torch.load(name)
         # load params
         ac_model.load_state_dict(state_dict)
-        tester(ac_model,device)
+        tester(ac_model,device,task_config_file="config_files/multiMugTaskTest.json")
     
     print(f"Tester finished job")
